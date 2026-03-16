@@ -1,0 +1,288 @@
+import asyncio
+import httpx
+from datetime import datetime, timezone
+from pydantic import BaseModel
+from typing import Any
+
+from .rate_limit import RateLimitManager
+from ..config import get_settings
+from ..cache.database import CacheDatabase
+
+
+class GitHubRepo(BaseModel):
+    name: str
+    full_name: str
+    owner: str
+    description: str | None = None
+    is_fork: bool = False
+    forked_from: str | None = None
+    primary_language: str | None = None
+    github_url: str
+    stars: int = 0
+    is_archived: bool = False
+    topics: list[str] = []
+    updated_at: str
+    created_at: str
+    default_branch: str = 'main'
+
+
+class ForkInfo(BaseModel):
+    upstream_owner: str
+    upstream_repo: str
+    upstream_created_at: str
+    parent_stars: int = 0
+    parent_forks: int = 0
+    parent_archived: bool = False
+    default_branch: str = 'main'
+
+
+class ForkSyncStatus(BaseModel):
+    state: str  # 'up-to-date', 'behind', 'ahead', 'diverged', 'unknown'
+    behind_by: int = 0
+    ahead_by: int = 0
+
+
+class Commit(BaseModel):
+    sha: str
+    message: str
+    author: str
+    committed_at: str
+    url: str
+
+
+class Release(BaseModel):
+    tag_name: str
+    name: str | None = None
+    published_at: str
+    url: str
+
+
+class GitHubClient:
+    """
+    Rate-limit aware GitHub API client.
+
+    - Tracks rate limit remaining from response headers
+    - Automatic exponential backoff on 429/403
+    - Concurrency: max 2 simultaneous requests
+    - Delay: 500ms between requests minimum
+    - On abuse detection (429): wait 30s, retry once, then skip with 'unknown'
+    - Logs every API call to SQLite for debugging
+    """
+
+    BASE_URL = 'https://api.github.com'
+
+    def __init__(self, rate_limiter: RateLimitManager, db: CacheDatabase):
+        self.rate_limiter = rate_limiter
+        self.db = db
+        settings = get_settings()
+        self._token = settings.gh_token
+        self._delay_s = settings.request_delay_ms / 1000.0
+        self._semaphore = asyncio.Semaphore(settings.max_concurrency)
+        self._client: httpx.AsyncClient | None = None
+
+    async def __aenter__(self):
+        self._client = httpx.AsyncClient(
+            headers={
+                'Authorization': f'Bearer {self._token}',
+                'Accept': 'application/vnd.github+json',
+                'X-GitHub-Api-Version': '2022-11-28',
+            },
+            timeout=30.0,
+        )
+        return self
+
+    async def __aexit__(self, *args):
+        if self._client:
+            await self._client.aclose()
+
+    async def _request(self, method: str, path: str, **kwargs) -> dict | list | None:
+        url = f'{self.BASE_URL}{path}'
+        async with self._semaphore:
+            await asyncio.sleep(self._delay_s)
+
+            # Pause if rate limit critically low
+            should_pause, wait_secs = await self.rate_limiter.should_pause()
+            if should_pause:
+                await asyncio.sleep(wait_secs)
+
+            for attempt in range(2):
+                try:
+                    resp = await self._client.request(method, url, **kwargs)
+                    self._update_rate_limit(resp)
+                    self.rate_limiter.record_call()
+
+                    await self.db.log_api_call(
+                        endpoint=path,
+                        status_code=resp.status_code,
+                        rate_limit_remaining=self._parse_remaining(resp),
+                    )
+
+                    if resp.status_code == 200:
+                        return resp.json()
+                    elif resp.status_code == 404:
+                        return None
+                    elif resp.status_code in (429, 403):
+                        if attempt == 0:
+                            await asyncio.sleep(30)
+                            continue
+                        return None
+                    elif resp.status_code == 204:
+                        return {}
+                    else:
+                        return None
+                except httpx.RequestError:
+                    if attempt == 0:
+                        await asyncio.sleep(5)
+                        continue
+                    return None
+        return None
+
+    def _parse_remaining(self, resp: httpx.Response) -> int | None:
+        try:
+            return int(resp.headers.get('x-ratelimit-remaining', 0))
+        except (ValueError, TypeError):
+            return None
+
+    def _update_rate_limit(self, resp: httpx.Response) -> None:
+        try:
+            remaining = int(resp.headers.get('x-ratelimit-remaining', 5000))
+            limit = int(resp.headers.get('x-ratelimit-limit', 5000))
+            reset_ts = int(resp.headers.get('x-ratelimit-reset', 0))
+            reset_at = datetime.fromtimestamp(reset_ts, tz=timezone.utc)
+            self.rate_limiter.update(remaining, limit, reset_at)
+        except (ValueError, TypeError):
+            pass
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    async def get_repos(self, username: str) -> list[GitHubRepo]:
+        repos: list[GitHubRepo] = []
+        page = 1
+        while True:
+            data = await self._request('GET', f'/users/{username}/repos', params={
+                'per_page': 100,
+                'page': page,
+                'type': 'all',
+                'sort': 'updated',
+            })
+            if not data:
+                break
+            for r in data:
+                repos.append(GitHubRepo(
+                    name=r['name'],
+                    full_name=r['full_name'],
+                    owner=r['owner']['login'],
+                    description=r.get('description'),
+                    is_fork=r.get('fork', False),
+                    forked_from=r['parent']['full_name'] if r.get('fork') and r.get('parent') else None,
+                    primary_language=r.get('language'),
+                    github_url=r['html_url'],
+                    stars=r.get('stargazers_count', 0),
+                    is_archived=r.get('archived', False),
+                    topics=r.get('topics', []),
+                    updated_at=r['updated_at'],
+                    created_at=r['created_at'],
+                    default_branch=r.get('default_branch', 'main'),
+                ))
+            if len(data) < 100:
+                break
+            page += 1
+        return repos
+
+    async def get_fork_info(self, owner: str, repo: str) -> ForkInfo | None:
+        data = await self._request('GET', f'/repos/{owner}/{repo}')
+        if not data or not data.get('fork'):
+            return None
+        parent = data.get('parent', {})
+        return ForkInfo(
+            upstream_owner=parent.get('owner', {}).get('login', 'unknown'),
+            upstream_repo=parent.get('name', 'unknown'),
+            upstream_created_at=parent.get('created_at', ''),
+            parent_stars=parent.get('stargazers_count', 0),
+            parent_forks=parent.get('forks_count', 0),
+            parent_archived=parent.get('archived', False),
+            default_branch=parent.get('default_branch', 'main'),
+        )
+
+    async def get_readme(self, owner: str, repo: str) -> str | None:
+        data = await self._request('GET', f'/repos/{owner}/{repo}/readme')
+        if not data:
+            return None
+        import base64
+        content = data.get('content', '')
+        try:
+            return base64.b64decode(content.replace('\n', '')).decode('utf-8', errors='replace')
+        except Exception:
+            return None
+
+    async def get_languages(self, owner: str, repo: str) -> dict[str, int]:
+        data = await self._request('GET', f'/repos/{owner}/{repo}/languages')
+        return data if isinstance(data, dict) else {}
+
+    async def get_fork_sync(
+        self, fork_owner: str, fork_repo: str,
+        upstream_owner: str, upstream_repo: str, branch: str
+    ) -> ForkSyncStatus:
+        data = await self._request(
+            'GET',
+            f'/repos/{upstream_owner}/{upstream_repo}/compare/{upstream_owner}:{branch}...{fork_owner}:{branch}'
+        )
+        if not data:
+            return ForkSyncStatus(state='unknown')
+        status = data.get('status', 'unknown')
+        ahead = data.get('ahead_by', 0)
+        behind = data.get('behind_by', 0)
+        if status == 'identical':
+            state = 'up-to-date'
+        elif behind > 0 and ahead > 0:
+            state = 'diverged'
+        elif behind > 0:
+            state = 'behind'
+        elif ahead > 0:
+            state = 'ahead'
+        else:
+            state = 'up-to-date'
+        return ForkSyncStatus(state=state, behind_by=behind, ahead_by=ahead)
+
+    async def get_commits_since(self, owner: str, repo: str, since: datetime) -> list[Commit]:
+        data = await self._request('GET', f'/repos/{owner}/{repo}/commits', params={
+            'since': since.isoformat(),
+            'per_page': 30,
+        })
+        if not data or not isinstance(data, list):
+            return []
+        commits = []
+        for c in data[:30]:
+            commit_data = c.get('commit', {})
+            committer = commit_data.get('committer', {}) or {}
+            author_info = commit_data.get('author', {}) or committer
+            commits.append(Commit(
+                sha=c['sha'][:8],
+                message=commit_data.get('message', '').split('\n')[0][:100],
+                author=author_info.get('name', 'unknown'),
+                committed_at=committer.get('date', ''),
+                url=c.get('html_url', ''),
+            ))
+        return commits
+
+    async def get_latest_release(self, owner: str, repo: str) -> Release | None:
+        data = await self._request('GET', f'/repos/{owner}/{repo}/releases/latest')
+        if not data:
+            return None
+        return Release(
+            tag_name=data.get('tag_name', ''),
+            name=data.get('name'),
+            published_at=data.get('published_at', ''),
+            url=data.get('html_url', ''),
+        )
+
+    async def get_rate_limit(self) -> RateLimitManager:
+        data = await self._request('GET', '/rate_limit')
+        if data:
+            core = data.get('resources', {}).get('core', {})
+            remaining = core.get('remaining', 5000)
+            limit = core.get('limit', 5000)
+            reset_ts = core.get('reset', 0)
+            reset_at = datetime.fromtimestamp(reset_ts, tz=timezone.utc)
+            self.rate_limiter.update(remaining, limit, reset_at)
+        return self.rate_limiter
