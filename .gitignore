@@ -25,3 +25,8 @@ build/
 # Coverage
 .coverage
 htmlcov/
+
+# Certificates and keys
+*.pem
+*.key
+*.cert
