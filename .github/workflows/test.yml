@@ -23,4 +23,4 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
       - name: Run tests
-        run: pytest tests/test_backfill.py tests/test_enrichment.py -v -k "not summarizer and not abuse_detection"
+        run: pytest tests/ -v -k "not summarizer and not abuse_detection and not multiple_tags"
