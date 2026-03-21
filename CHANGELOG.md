@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0] - 2026-03-21
+
+### Added
+- CI workflow (`.github/workflows/test.yml`) — runs on push to main, 3 new unit tests
+- `scripts/fetch_commit_stats.py` — populates commit counts from GitHub API /stats/commit_activity
+- 395 repos now have commits_last_30_days > 0 (previously all zeros)
+
 ## [1.1.0] - 2026-03-21
 
 ### Added
