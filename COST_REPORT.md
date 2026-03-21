@@ -14,7 +14,8 @@
 | Phase 4 | Knowledge graph edge building | $0.00 | 6 min |
 | Phase 5 | /intelligence/query endpoint | $0.00 | Deploy only |
 | Phase 6 | Documentation | $0.00 | — |
-| **Total** | | **$2.52** | ~2.5 hours |
+| Backfill | library.json to Neon (825 repos) | $0.00 | 27 min |
+| **Total** | | **$2.52** | ~3 hours |
 
 ## Phase 2 Breakdown (only paid phase)
 
@@ -47,6 +48,8 @@ At 100 queries/day = $1.20/day = ~$36/month
 - 826 semantic embeddings for natural language search
 - 5,418 knowledge graph edges (compatibility, alternatives, dependencies)
 - A working /intelligence/query endpoint that answers natural language questions
+- Full database backfill: 14K tags, 2K pmSkills, 918 industries, 825 builders
+- reporium.com switched from static JSON to live API
 
 ## Budget vs Actual
 
