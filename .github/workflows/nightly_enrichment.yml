@@ -1,0 +1,64 @@
+name: Nightly Enrichment
+
+on:
+  schedule:
+    - cron: "0 7 * * *"  # 7am UTC, after reporium-db sync
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt psycopg2-binary anthropic sentence-transformers
+      - name: Run enrichment for new repos
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python -c "
+          import os, psycopg2, anthropic, json, sys
+
+          db_url = os.environ['DATABASE_URL']
+          api_key = os.environ['ANTHROPIC_API_KEY'].strip()
+
+          conn = psycopg2.connect(db_url)
+          cur = conn.cursor()
+
+          # Find repos missing enrichment
+          cur.execute(\"SELECT id, name, owner, description, forked_from, primary_language FROM repos WHERE readme_summary IS NULL OR readme_summary = '';\")
+          repos = cur.fetchall()
+
+          if not repos:
+              print('No repos need enrichment.')
+              sys.exit(0)
+
+          print(f'Enriching {len(repos)} new repos...')
+          client = anthropic.Anthropic(api_key=api_key)
+
+          for i, (rid, name, owner, desc, forked_from, lang) in enumerate(repos):
+              prompt = f'Analyze this GitHub repository and return JSON: {{\"readme_summary\": \"2-3 sentence summary\", \"problem_solved\": \"1 sentence\", \"integration_tags\": [\"list\"]}}\\nRepo: {forked_from or f\"{owner}/{name}\"}\\nDescription: {desc or \"No description\"}\\nLanguage: {lang or \"Unknown\"}\\nReturn ONLY valid JSON.'
+              try:
+                  resp = client.messages.create(model='claude-sonnet-4-20250514', max_tokens=300, messages=[{'role': 'user', 'content': prompt}])
+                  text_out = resp.content[0].text.strip()
+                  if text_out.startswith('\`\`\`'): text_out = text_out.split('\\n', 1)[1].rsplit('\`\`\`', 1)[0]
+                  data = json.loads(text_out)
+                  cur.execute('UPDATE repos SET readme_summary = %s, problem_solved = %s, integration_tags = %s WHERE id = %s;',
+                      (data.get('readme_summary',''), data.get('problem_solved',''), json.dumps(data.get('integration_tags',[])), str(rid)))
+                  conn.commit()
+              except Exception as e:
+                  print(f'Error on {owner}/{name}: {e}')
+              if (i+1) % 10 == 0:
+                  print(f'  Progress: {i+1}/{len(repos)}')
+
+          conn.commit()
+          print(f'Done. Enriched {len(repos)} repos.')
+          conn.close()
+          "
