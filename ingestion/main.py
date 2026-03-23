@@ -153,6 +153,7 @@ async def _to_api_payload(
         'owner': repo.owner,
         'description': repo.description,
         'is_fork': repo.is_fork,
+        'is_private': repo.is_private,
         'forked_from': repo.forked_from,
         'primary_language': repo.primary_language,
         'github_url': repo.github_url,

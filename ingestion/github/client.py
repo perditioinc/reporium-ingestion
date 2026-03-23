@@ -15,6 +15,7 @@ class GitHubRepo(BaseModel):
     owner: str
     description: str | None = None
     is_fork: bool = False
+    is_private: bool = False
     forked_from: str | None = None
     primary_language: str | None = None
     github_url: str
@@ -168,12 +169,16 @@ class GitHubClient:
             if not data:
                 break
             for r in data:
+                # Skip private repos — only public repos belong in Reporium
+                if r.get('private', False):
+                    continue
                 repos.append(GitHubRepo(
                     name=r['name'],
                     full_name=r['full_name'],
                     owner=r['owner']['login'],
                     description=r.get('description'),
                     is_fork=r.get('fork', False),
+                    is_private=False,  # confirmed above: we skip any private=True
                     forked_from=r['parent']['full_name'] if r.get('fork') and r.get('parent') else None,
                     primary_language=r.get('language'),
                     github_url=r['html_url'],

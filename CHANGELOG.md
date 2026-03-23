@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.0] - 2026-03-23
+
+### Added
+- `scripts/backfill_fork_dates.py` — fetches `forked_at`, `your_last_push_at`, and `upstream_created_at`
+  from GitHub GraphQL API for all forks missing these fields. Batches 50 repos per query, ~$0 cost.
+  Run with `GH_TOKEN=... DATABASE_URL=... python scripts/backfill_fork_dates.py [--dry-run]`.
+
+### Fixed
+- Identified root cause of missing fork timeline dates: none of the ingest pipelines (forksync, reporium-db,
+  backfill_from_library_json) ever wrote `forked_at` or `your_last_push_at` to the DB. All 1,390 forks
+  have empty values for these fields. Run the new backfill script to fix.
+
 ## [1.2.0] - 2026-03-21
 
 ### Added
