@@ -62,7 +62,7 @@
 
 **Context:** The query endpoint calls Claude API (~$0.01/query). Must not be public.
 
-**Decision:** Require X-API-Key header matching INGESTION_API_KEY. Same auth as ingest endpoints.
+**Decision:** Require `Authorization: Bearer {REPORIUM_API_KEY}` header. Same HTTPBearer auth as ingest endpoints.
 
 **Why:** Simple, already implemented. Prevents anonymous users from running up Claude API costs. A future version could add per-user API keys with rate limiting.
 
