@@ -157,6 +157,7 @@ async def _to_api_payload(
         'forked_from': repo.forked_from,
         'primary_language': repo.primary_language,
         'github_url': repo.github_url,
+        'open_issues_count': repo.open_issues_count,
         'fork_sync_state': fetched.fork_sync_state,
         'behind_by': fetched.behind_by,
         'ahead_by': fetched.ahead_by,
