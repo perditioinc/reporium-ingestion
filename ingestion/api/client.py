@@ -28,6 +28,8 @@ class ReporiumAPIClient:
             'Authorization': f'Bearer {self.settings.reporium_api_key}',
             'Content-Type': 'application/json',
         }
+        if self.settings.ingest_api_key:
+            self._headers['X-Ingest-Key'] = self.settings.ingest_api_key
 
     async def check_connection(self) -> bool:
         try:
@@ -65,8 +67,8 @@ class ReporiumAPIClient:
                             upserted=data.get('upserted', len(repos)),
                             errors=data.get('errors', []),
                         )
-                    elif resp.status_code == 401:
-                        return UpsertResult(upserted=0, errors=['Unauthorized — check REPORIUM_API_KEY'])
+                    elif resp.status_code in (401, 403):
+                        return UpsertResult(upserted=0, errors=[f'Auth error ({resp.status_code}) — check REPORIUM_API_KEY / INGEST_API_KEY'])
                     else:
                         if attempt < 2:
                             import asyncio
