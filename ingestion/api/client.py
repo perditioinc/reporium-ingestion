@@ -1,10 +1,15 @@
+import logging
+from typing import Any
+
 import httpx
 from pydantic import BaseModel
-from typing import Any
 
 from ..config import get_settings
 from ..analysis.trends import TrendSnapshot
 from ..analysis.gaps import Gap
+
+
+logger = logging.getLogger(__name__)
 
 
 class UpsertResult(BaseModel):
@@ -92,7 +97,11 @@ class ReporiumAPIClient:
                     headers=self._headers,
                 )
         except Exception:
-            pass  # Non-critical
+            logger.warning(
+                "Failed to post trend snapshot to reporium-api",
+                extra={"snapshot_captured_at": snapshot.captured_at},
+                exc_info=True,
+            )
 
     async def post_gap_analysis(self, gaps: list[Gap]) -> None:
         try:
@@ -103,7 +112,11 @@ class ReporiumAPIClient:
                     headers=self._headers,
                 )
         except Exception:
-            pass  # Non-critical
+            logger.warning(
+                "Failed to post gap analysis to reporium-api",
+                extra={"gap_count": len(gaps)},
+                exc_info=True,
+            )
 
     async def log_run(self, run_data: dict) -> None:
         try:
@@ -114,4 +127,8 @@ class ReporiumAPIClient:
                     headers=self._headers,
                 )
         except Exception:
-            pass  # Non-critical
+            logger.warning(
+                "Failed to log ingestion run to reporium-api",
+                extra={"run_status": run_data.get("status"), "run_mode": run_data.get("mode")},
+                exc_info=True,
+            )

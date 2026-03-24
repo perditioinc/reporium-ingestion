@@ -11,6 +11,7 @@ Usage:
     python -m ingestion schedule
 """
 import asyncio
+import logging
 import sys
 import time
 import json
@@ -35,12 +36,12 @@ from .enrichment.taxonomy import (
     assign_dimension, build_builder, PM_SKILLS,
 )
 from .enrichment.summarizer import RepoSummarizer
-from .enrichment.embeddings import EmbeddingGenerator
 from .api.client import ReporiumAPIClient
 from .analysis.trends import build_trend_snapshot
 from .analysis.gaps import detect_gaps
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 def _compute_commit_stats(commits: list[dict]) -> dict:
@@ -59,7 +60,11 @@ def _compute_commit_stats(commits: list[dict]) -> dict:
             if days < 90:
                 stats['last90Days'] += 1
         except Exception:
-            pass
+            logger.warning(
+                "Skipping malformed commit while computing stats",
+                extra={"commit_sha": c.get("sha"), "committed_at": c.get("committed_at")},
+                exc_info=True,
+            )
     return stats
 
 
@@ -73,7 +78,6 @@ def _build_language_percentages(breakdown: dict[str, int]) -> dict[str, float]:
 async def _to_api_payload(
     fetched: FetchedRepo,
     summarizer: RepoSummarizer,
-    embedder: EmbeddingGenerator,
 ) -> dict:
     repo = fetched.github_repo
 
@@ -195,7 +199,6 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
 
     rate_limiter = RateLimitManager(min_buffer=settings.min_rate_limit_buffer)
     summarizer = RepoSummarizer()
-    embedder = EmbeddingGenerator()
     api_client = ReporiumAPIClient()
 
     run_id = await db.start_run(mode.value)
@@ -266,7 +269,7 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
         # Enrich with AI
         with console.status('Enriching with AI...'):
             for fetched in fetched_repos:
-                payload = await _to_api_payload(fetched, summarizer, embedder)
+                payload = await _to_api_payload(fetched, summarizer)
                 payloads.append(payload)
 
         enriched_count = len(payloads)
