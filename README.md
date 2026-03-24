@@ -4,6 +4,8 @@ AI-native ingestion pipeline for Reporium. Runs on a Mac Mini, never exposed to 
 
 Fetches GitHub repositories, enriches them with local AI (Ollama), and writes to reporium-api.
 
+Historical note: API-call counts and throughput examples in this README were captured during the March 2026 milestone corpus. Treat them as directional operating examples, not as the current live corpus size or current run cost.
+
 ---
 
 ## Stack
@@ -70,13 +72,13 @@ This checks all connections and runs a full ingestion.
 ## Usage
 
 ```bash
-# Quick incremental update (default, ~127 API calls)
+# Quick incremental update (default, historical March 2026 estimate: ~127 API calls)
 python -m ingestion run
 
-# Weekly refresh (~800 API calls)
+# Weekly refresh (historical March 2026 estimate: ~800 API calls)
 python -m ingestion run --mode weekly
 
-# Full refresh — use sparingly (~5000 API calls)
+# Full refresh — use sparingly (historical March 2026 estimate: ~5000 API calls)
 python -m ingestion run --mode full
 
 # Fix specific repos (after rate limit recovery)
@@ -96,6 +98,8 @@ python -m ingestion schedule
 ---
 
 ## Run Modes
+
+These API-call counts are historical March 2026 estimates from the 826-repo milestone corpus. Current runs scale with the live repo count and current cache state.
 
 | Mode | API Calls | When |
 |------|-----------|------|
