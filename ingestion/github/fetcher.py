@@ -29,6 +29,8 @@ class FetchedRepo:
         self.parent_stars: int = 0
         self.parent_forks: int = 0
         self.parent_archived: bool = False
+        self.dependencies: list[str] = []
+        self.dep_source_file: str | None = None
 
 
 class RepoFetcher:
@@ -151,6 +153,25 @@ class RepoFetcher:
         fetched.readme = readme
         fetched.commits = [c.model_dump() for c in commits]
         fetched.latest_release = release.model_dump() if release else None
+
+        # Fetch dependency file (bundled with daily fetch — no extra API calls budget)
+        from ..extractors.dependencies import DEPENDENCY_FILES, PARSERS
+        target_owner = repo.owner
+        target_repo = repo.name
+        # For forks, try upstream first
+        if repo.is_fork and repo.forked_from:
+            parts = repo.forked_from.split('/')
+            if len(parts) == 2:
+                target_owner, target_repo = parts[0], parts[1]
+
+        for filepath in DEPENDENCY_FILES:
+            content = await self.client.get_file(target_owner, target_repo, filepath)
+            if content:
+                parser = PARSERS.get(filepath)
+                if parser:
+                    fetched.dependencies = parser(content)
+                    fetched.dep_source_file = f'{target_owner}/{target_repo}/{filepath}'
+                break
 
     async def _fetch_weekly(self, fetched: FetchedRepo) -> None:
         repo = fetched.github_repo
