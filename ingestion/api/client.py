@@ -1,10 +1,15 @@
+import logging
+from typing import Any
+
 import httpx
 from pydantic import BaseModel
-from typing import Any
 
 from ..config import get_settings
 from ..analysis.trends import TrendSnapshot
 from ..analysis.gaps import Gap
+
+
+logger = logging.getLogger(__name__)
 
 
 class UpsertResult(BaseModel):
@@ -28,6 +33,8 @@ class ReporiumAPIClient:
             'Authorization': f'Bearer {self.settings.reporium_api_key}',
             'Content-Type': 'application/json',
         }
+        if self.settings.ingest_api_key:
+            self._headers['X-Ingest-Key'] = self.settings.ingest_api_key
 
     async def check_connection(self) -> bool:
         try:
@@ -65,8 +72,8 @@ class ReporiumAPIClient:
                             upserted=data.get('upserted', len(repos)),
                             errors=data.get('errors', []),
                         )
-                    elif resp.status_code == 401:
-                        return UpsertResult(upserted=0, errors=['Unauthorized — check REPORIUM_API_KEY'])
+                    elif resp.status_code in (401, 403):
+                        return UpsertResult(upserted=0, errors=[f'Auth error ({resp.status_code}) — check REPORIUM_API_KEY / INGEST_API_KEY'])
                     else:
                         if attempt < 2:
                             import asyncio
@@ -90,7 +97,11 @@ class ReporiumAPIClient:
                     headers=self._headers,
                 )
         except Exception:
-            pass  # Non-critical
+            logger.warning(
+                "Failed to post trend snapshot to reporium-api",
+                extra={"snapshot_captured_at": snapshot.captured_at},
+                exc_info=True,
+            )
 
     async def post_gap_analysis(self, gaps: list[Gap]) -> None:
         try:
@@ -101,7 +112,11 @@ class ReporiumAPIClient:
                     headers=self._headers,
                 )
         except Exception:
-            pass  # Non-critical
+            logger.warning(
+                "Failed to post gap analysis to reporium-api",
+                extra={"gap_count": len(gaps)},
+                exc_info=True,
+            )
 
     async def log_run(self, run_data: dict) -> None:
         try:
@@ -112,4 +127,8 @@ class ReporiumAPIClient:
                     headers=self._headers,
                 )
         except Exception:
-            pass  # Non-critical
+            logger.warning(
+                "Failed to log ingestion run to reporium-api",
+                extra={"run_status": run_data.get("status"), "run_mode": run_data.get("mode")},
+                exc_info=True,
+            )

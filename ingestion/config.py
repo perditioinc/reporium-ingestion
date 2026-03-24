@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     # reporium-api
     reporium_api_url: str = Field('http://localhost:8000', env='REPORIUM_API_URL')
     reporium_api_key: str = Field('', env='REPORIUM_API_KEY')
+    ingest_api_key: str = Field('', env='INGEST_API_KEY')
 
     # Claude API (replaces Ollama)
     anthropic_api_key: str = Field('', env='ANTHROPIC_API_KEY')
@@ -77,6 +78,9 @@ class Settings(BaseSettings):
     max_concurrency: int = Field(2, env='MAX_CONCURRENCY')
     request_delay_ms: int = Field(500, env='REQUEST_DELAY_MS')
 
+    # Events (GCP Pub/Sub)
+    pubsub_repo_ingested_topic: str = Field('', env='PUBSUB_REPO_INGESTED_TOPIC')
+
     # Cache
     cache_db_path: str = Field('./data/cache.db', env='CACHE_DB_PATH')
 
@@ -95,6 +99,7 @@ class Settings(BaseSettings):
         secret_map = {
             'anthropic_api_key': 'anthropic-api-key',
             'reporium_api_key': 'reporium-ingestion-api-key',
+            'ingest_api_key': 'reporium-ingest-api-key',
             'database_url': 'reporium-db-url',
         }
         for field_name, secret_id in secret_map.items():
