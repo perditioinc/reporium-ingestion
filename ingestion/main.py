@@ -285,6 +285,15 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
             for err in result.errors[:5]:
                 console.print(f'  [red]⚠ {err}[/red]')
 
+        # Publish event so the API can trigger taxonomy + intelligence refresh
+        if repos_updated > 0:
+            from .events.pubsub import publish_repo_ingested
+            publish_repo_ingested(
+                run_mode=mode.value,
+                upserted=repos_updated,
+                repo_names=[p['name'] for p in payloads],
+            )
+
         # Post trend snapshot and gap analysis on weekly/full runs
         if mode in (RunMode.WEEKLY, RunMode.FULL):
             with console.status('Computing trends & gaps...'):
