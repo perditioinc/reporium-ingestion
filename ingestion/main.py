@@ -32,7 +32,7 @@ from .github.fetcher import RepoFetcher, FetchedRepo
 from .enrichment.tagger import enrich_tags
 from .enrichment.taxonomy import (
     assign_primary_category, assign_all_categories,
-    assign_dimension, build_builder, AI_DEV_SKILLS, PM_SKILLS,
+    assign_dimension, build_builder, PM_SKILLS,
 )
 from .enrichment.summarizer import RepoSummarizer
 from .enrichment.embeddings import EmbeddingGenerator
@@ -91,7 +91,6 @@ async def _to_api_payload(
     # Taxonomy
     primary_category = assign_primary_category(tags)
     all_categories = assign_all_categories(tags)
-    ai_dev_skills = assign_dimension(tags, AI_DEV_SKILLS)
     pm_skills = assign_dimension(tags, PM_SKILLS)
 
     # Builder
@@ -169,8 +168,17 @@ async def _to_api_payload(
         'tags': tags,
         'categories': categories_list,
         'builders': [builder],
-        'ai_dev_skills': ai_dev_skills,
         'pm_skills': pm_skills,
+        # Open taxonomy dimensions — populated by the AI enricher, not the tagger
+        'skill_areas': [],
+        'industries': [],
+        'use_cases': [],
+        'modalities': [],
+        'ai_trends': [],
+        'deployment_context': [],
+        'maturity_level': None,
+        'quality_assessment': None,
+        'integration_tags': [],
         'languages': languages_list,
         'commits': commits_list,
     }
