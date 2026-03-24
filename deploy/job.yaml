@@ -1,0 +1,50 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: reporium-ingestion-nightly
+spec:
+  template:
+    spec:
+      template:
+        spec:
+          maxRetries: 1
+          timeoutSeconds: 3600
+          containers:
+            - image: gcr.io/PROJECT_ID/reporium-ingestion:latest
+              command:
+                - python
+                - -m
+                - ingestion
+                - run
+                - --mode
+                - quick
+              resources:
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+              env:
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: GITHUB_TOKEN
+                      key: latest
+                - name: OPENAI_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: OPENAI_API_KEY
+                      key: latest
+                - name: REPORIUM_API_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: REPORIUM_API_URL
+                      key: latest
+                - name: REPORIUM_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: REPORIUM_API_KEY
+                      key: latest
+                - name: INGEST_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: INGEST_API_KEY
+                      key: latest

@@ -1,0 +1,15 @@
+apiVersion: cloudscheduler.cnrm.cloud.google.com/v1beta1
+kind: CloudSchedulerJob
+metadata:
+  name: reporium-ingestion-nightly
+spec:
+  location: REGION
+  schedule: "0 3 * * *"
+  timeZone: Etc/UTC
+  httpTarget:
+    httpMethod: POST
+    uri: https://run.googleapis.com/v2/projects/PROJECT_ID/locations/REGION/jobs/reporium-ingestion-nightly:run
+    headers:
+      Content-Type: application/json
+    oidcToken:
+      serviceAccountEmail: ingestion-scheduler@PROJECT_ID.iam.gserviceaccount.com
