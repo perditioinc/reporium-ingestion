@@ -26,6 +26,7 @@ class GitHubRepo(BaseModel):
     updated_at: str
     created_at: str
     default_branch: str = 'main'
+    license_spdx: str | None = None
 
 
 class ForkInfo(BaseModel):
@@ -173,6 +174,8 @@ class GitHubClient:
                 # Skip private repos — only public repos belong in Reporium
                 if r.get('private', False):
                     continue
+                _raw_spdx = r.get('license', {}).get('spdx_id') if r.get('license') else None
+                license_spdx = _raw_spdx if _raw_spdx and _raw_spdx != 'NOASSERTION' else None
                 repos.append(GitHubRepo(
                     name=r['name'],
                     full_name=r['full_name'],
@@ -190,6 +193,7 @@ class GitHubClient:
                     updated_at=r['updated_at'],
                     created_at=r['created_at'],
                     default_branch=r.get('default_branch', 'main'),
+                    license_spdx=license_spdx,
                 ))
             if len(data) < 100:
                 break
@@ -282,6 +286,21 @@ class GitHubClient:
             published_at=data.get('published_at', ''),
             url=data.get('html_url', ''),
         )
+
+    async def get_file(self, owner: str, repo: str, filepath: str) -> str | None:
+        """Fetch a raw file from a repo. Returns text content or None if not found."""
+        data = await self._request('GET', f'/repos/{owner}/{repo}/contents/{filepath}')
+        if not data or not isinstance(data, dict):
+            return None
+        import base64 as _b64
+        content = data.get('content', '')
+        encoding = data.get('encoding', 'base64')
+        if encoding == 'base64':
+            try:
+                return _b64.b64decode(content.replace('\n', '')).decode('utf-8', errors='replace')
+            except Exception:
+                return None
+        return None
 
     async def get_rate_limit(self) -> RateLimitManager:
         data = await self._request('GET', '/rate_limit')
