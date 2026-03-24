@@ -31,6 +31,8 @@ Respond with ONLY valid JSON, no markdown, no explanation:
   "readme_summary": "2-3 sentence plain language description of what this repo does and who uses it",
   "problem_solved": "1 sentence: what specific problem does this solve",
   "categories": ["category1", "category2"],
+  "ai_dev_skills": ["skill1", "skill2"],
+  "lifecycleGroup": "Foundation & Training|Inference & Deployment|LLM Application Layer|Eval/Safety/Ops|Modality-Specific|Applied AI",
   "integration_tags": ["tool1", "tool2"],
   "quality_assessment": "high|medium|low"
 }}
@@ -40,6 +42,16 @@ agents, llm-serving, embeddings, vector-databases, evaluation, fine-tuning,
 rag, orchestration, observability, data-processing, ocr, vision, audio,
 code-generation, security, deployment, tooling, datasets, research, other
 
+ai_dev_skills must only come from this list of 28 skill areas (a repo can match multiple):
+Foundation & Training group: Foundation Model Architecture, Fine-tuning & Alignment, Data Engineering, Synthetic Data
+Inference & Deployment group: Inference & Serving, Model Compression, Edge AI
+LLM Application Layer group: Agents & Orchestration, RAG & Retrieval, Context Engineering, Tool Use, Structured Output, Prompt Engineering, Knowledge Graphs
+Eval/Safety/Ops group: Evaluation, Security & Guardrails, Observability, MLOps, AI Governance
+Modality-Specific group: Computer Vision, Speech & Audio, Generative Media, NLP, Multimodal
+Applied AI group: Coding Assistants, Robotics, AI for Science, Recommendation Systems
+
+lifecycleGroup must be the single best-matching group name from the 6 groups above.
+
 Integration tags are frameworks/tools this repo integrates with (e.g. langchain, openai, huggingface, fastapi).
 Maximum 5 integration tags. If unknown, use empty array."""
 
@@ -48,6 +60,31 @@ VALID_CATEGORIES = {
     "fine-tuning", "rag", "orchestration", "observability", "data-processing",
     "ocr", "vision", "audio", "code-generation", "security", "deployment",
     "tooling", "datasets", "research", "other",
+}
+
+VALID_AI_DEV_SKILLS = {
+    # Foundation & Training
+    "Foundation Model Architecture", "Fine-tuning & Alignment", "Data Engineering", "Synthetic Data",
+    # Inference & Deployment
+    "Inference & Serving", "Model Compression", "Edge AI",
+    # LLM Application Layer
+    "Agents & Orchestration", "RAG & Retrieval", "Context Engineering", "Tool Use",
+    "Structured Output", "Prompt Engineering", "Knowledge Graphs",
+    # Eval/Safety/Ops
+    "Evaluation", "Security & Guardrails", "Observability", "MLOps", "AI Governance",
+    # Modality-Specific
+    "Computer Vision", "Speech & Audio", "Generative Media", "NLP", "Multimodal",
+    # Applied AI
+    "Coding Assistants", "Robotics", "AI for Science", "Recommendation Systems",
+}
+
+VALID_LIFECYCLE_GROUPS = {
+    "Foundation & Training",
+    "Inference & Deployment",
+    "LLM Application Layer",
+    "Eval/Safety/Ops",
+    "Modality-Specific",
+    "Applied AI",
 }
 
 
@@ -112,6 +149,17 @@ def _parse_enrichment_response(text: str) -> dict:
     if not valid and categories:
         valid = ["other"]
     data["categories"] = valid[:5]
+
+    # Validate ai_dev_skills (28-skill taxonomy)
+    raw_skills = data.get("ai_dev_skills", [])
+    valid_skills = [s for s in raw_skills if s in VALID_AI_DEV_SKILLS]
+    data["ai_dev_skills"] = valid_skills[:10]
+
+    # Validate lifecycleGroup
+    lifecycle = data.get("lifecycleGroup", "")
+    if lifecycle not in VALID_LIFECYCLE_GROUPS:
+        lifecycle = ""
+    data["lifecycleGroup"] = lifecycle
 
     # Validate integration_tags
     tags = data.get("integration_tags", [])
@@ -255,13 +303,14 @@ async def run_ai_enrichment(
                     ),
                 )
 
-            # Write ai_dev_skills from categories (map categories to skills)
-            for cat in categories:
+            # Write ai_dev_skills from the 28-skill taxonomy
+            ai_dev_skills = data.get("ai_dev_skills", [])
+            for skill in ai_dev_skills:
                 cur.execute(
                     """INSERT INTO repo_ai_dev_skills (repo_id, skill)
                     VALUES (%s, %s)
                     ON CONFLICT DO NOTHING""",
-                    (repo["id"], cat),
+                    (repo["id"], skill),
                 )
 
             conn.commit()
