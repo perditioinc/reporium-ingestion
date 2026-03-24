@@ -21,6 +21,7 @@ class GitHubRepo(BaseModel):
     github_url: str
     stars: int = 0
     open_issues_count: int = 0
+    license_spdx: str | None = None
     is_archived: bool = False
     topics: list[str] = []
     updated_at: str
@@ -185,6 +186,7 @@ class GitHubClient:
                     github_url=r['html_url'],
                     stars=r.get('stargazers_count', 0),
                     open_issues_count=r.get('open_issues_count', 0),
+                    license_spdx=(r.get('license') or {}).get('spdx_id'),
                     is_archived=r.get('archived', False),
                     topics=r.get('topics', []),
                     updated_at=r['updated_at'],
