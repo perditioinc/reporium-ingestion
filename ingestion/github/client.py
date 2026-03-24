@@ -20,6 +20,7 @@ class GitHubRepo(BaseModel):
     primary_language: str | None = None
     github_url: str
     stars: int = 0
+    open_issues_count: int = 0
     is_archived: bool = False
     topics: list[str] = []
     updated_at: str
@@ -183,6 +184,7 @@ class GitHubClient:
                     primary_language=r.get('language'),
                     github_url=r['html_url'],
                     stars=r.get('stargazers_count', 0),
+                    open_issues_count=r.get('open_issues_count', 0),
                     is_archived=r.get('archived', False),
                     topics=r.get('topics', []),
                     updated_at=r['updated_at'],
