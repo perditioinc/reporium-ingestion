@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     max_concurrency: int = Field(2, env='MAX_CONCURRENCY')
     request_delay_ms: int = Field(500, env='REQUEST_DELAY_MS')
 
+    # Events (GCP Pub/Sub)
+    pubsub_repo_ingested_topic: str = Field('', env='PUBSUB_REPO_INGESTED_TOPIC')
+
     # Cache
     cache_db_path: str = Field('./data/cache.db', env='CACHE_DB_PATH')
 
