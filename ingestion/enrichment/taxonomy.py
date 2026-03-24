@@ -193,66 +193,84 @@ CATEGORIES: list[dict] = [
     },
 ]
 
-# ── AI Dev Skills ─────────────────────────────────────────────────────────────
+# ── AI Dev Skills (28-skill taxonomy, 6 lifecycle groups) ─────────────────────
 
-AI_DEV_SKILLS: dict[str, list[str]] = {
-    'Observability & Monitoring': [
-        'Langfuse', 'Phoenix', 'OpenLIT', 'OpenLLMetry', 'Helicone',
-        'Traceloop', 'Weights & Biases', 'MLflow', 'OpenTelemetry',
-        'Monitoring', 'Tracing', 'LLM Monitoring'
-    ],
-    'Evals & Benchmarking': [
-        'DeepEval', 'RAGAS', 'PromptFoo', 'LM Eval Harness', 'Evals',
-        'Benchmarking', 'Red Teaming', 'Garak', 'PyRIT', 'MMLU', 'HumanEval'
-    ],
-    'Inference & Serving': [
-        'vLLM', 'SGLang', 'TGI', 'Triton', 'TensorRT', 'ONNX',
-        'llama.cpp', 'Llamafile', 'LLM Serving', 'Quantization',
-        'Speculative Decoding', 'KV Cache', 'GPU / CUDA', 'Inference'
-    ],
-    'Model Training & Fine-tuning': [
-        'Unsloth', 'Axolotl', 'TRL', 'TorchTune', 'LoRA / PEFT',
-        'RLHF', 'DPO', 'GRPO', 'DeepSpeed', 'FSDP',
-        'Synthetic Data', 'Distillation', 'Fine-Tuning', 'MergeKit'
-    ],
-    'Structured Output & Reliability': [
-        'Instructor', 'Outlines', 'Guidance', 'Guardrails',
-        'NeMo Guardrails', 'Structured Output', 'Tool Use', 'Pydantic'
-    ],
-    'AI Agents & Orchestration': [
-        'AI Agents', 'LangChain', 'LangGraph', 'DSPy', 'Semantic Kernel',
-        'Haystack', 'Agno', 'CrewAI', 'AutoGen', 'Swarm',
-        'OpenAI Agents SDK', 'Multi-Agent', 'MCP', 'Autonomous Systems'
-    ],
-    'RAG & Knowledge': [
-        'RAG', 'Vector Database', 'Embeddings', 'Knowledge Graph',
-        'Chroma', 'Qdrant', 'Milvus', 'Weaviate', 'Pinecone', 'pgvector',
-        'Reranking', 'Hybrid Search', 'GraphRAG', 'Document Processing',
-        'LlamaIndex', 'LightRAG'
-    ],
-    'Context Engineering': [
-        'Context Engineering', 'Agent Memory', 'Letta / MemGPT', 'Mem0',
-        'Long Context', 'Planning / CoT', 'Prompt Engineering'
-    ],
-    'Security & Safety': [
-        'AI Safety', 'Red Teaming', 'Garak', 'PyRIT', 'Prompt Injection',
-        'Guardrails', 'Watermarking', 'Privacy-Preserving AI', 'Alignment'
-    ],
-    'Coding Assistants & Dev Tools': [
-        'OpenHands', 'Cline', 'Continue.dev', 'Aider', 'SWE-Agent',
-        'Claude Code', 'Gemini CLI', 'Kilocode', 'CLI Tool', 'Automation'
-    ],
-    'MLOps & Data': [
-        'MLOps', 'DVC', 'ZenML', 'Prefect', 'Airflow', 'Ray',
-        'Kubeflow', 'Feature Store', 'MLflow', 'Docker', 'Kubernetes',
-        'CI/CD', 'Model Registry'
-    ],
-    'Multimodal & Vision': [
-        'Computer Vision', 'Image Generation', 'Video Generation',
-        'Multimodal AI', 'Point Cloud / 3D Vision', 'Object Detection',
-        'Segmentation', 'Depth Estimation', '3D Reconstruction',
-        'Text to Speech', 'Speech to Text', 'Music / Audio AI'
-    ],
+LIFECYCLE_GROUPS: list[str] = [
+    "Foundation & Training",
+    "Inference & Deployment",
+    "LLM Application Layer",
+    "Eval/Safety/Ops",
+    "Modality-Specific",
+    "Applied AI",
+]
+
+AI_DEV_SKILLS: list[str] = [
+    # Foundation & Training
+    "Foundation Model Architecture",
+    "Fine-tuning & Alignment",
+    "Data Engineering",
+    "Synthetic Data",
+    # Inference & Deployment
+    "Inference & Serving",
+    "Model Compression",
+    "Edge AI",
+    # LLM Application Layer
+    "Agents & Orchestration",
+    "RAG & Retrieval",
+    "Context Engineering",
+    "Tool Use",
+    "Structured Output",
+    "Prompt Engineering",
+    "Knowledge Graphs",
+    # Eval/Safety/Ops
+    "Evaluation",
+    "Security & Guardrails",
+    "Observability",
+    "MLOps",
+    "AI Governance",
+    # Modality-Specific
+    "Computer Vision",
+    "Speech & Audio",
+    "Generative Media",
+    "NLP",
+    "Multimodal",
+    # Applied AI
+    "Coding Assistants",
+    "Robotics",
+    "AI for Science",
+    "Recommendation Systems",
+]
+
+# Mapping from skill area name to its lifecycle group
+SKILL_TO_LIFECYCLE_GROUP: dict[str, str] = {
+    "Foundation Model Architecture": "Foundation & Training",
+    "Fine-tuning & Alignment": "Foundation & Training",
+    "Data Engineering": "Foundation & Training",
+    "Synthetic Data": "Foundation & Training",
+    "Inference & Serving": "Inference & Deployment",
+    "Model Compression": "Inference & Deployment",
+    "Edge AI": "Inference & Deployment",
+    "Agents & Orchestration": "LLM Application Layer",
+    "RAG & Retrieval": "LLM Application Layer",
+    "Context Engineering": "LLM Application Layer",
+    "Tool Use": "LLM Application Layer",
+    "Structured Output": "LLM Application Layer",
+    "Prompt Engineering": "LLM Application Layer",
+    "Knowledge Graphs": "LLM Application Layer",
+    "Evaluation": "Eval/Safety/Ops",
+    "Security & Guardrails": "Eval/Safety/Ops",
+    "Observability": "Eval/Safety/Ops",
+    "MLOps": "Eval/Safety/Ops",
+    "AI Governance": "Eval/Safety/Ops",
+    "Computer Vision": "Modality-Specific",
+    "Speech & Audio": "Modality-Specific",
+    "Generative Media": "Modality-Specific",
+    "NLP": "Modality-Specific",
+    "Multimodal": "Modality-Specific",
+    "Coding Assistants": "Applied AI",
+    "Robotics": "Applied AI",
+    "AI for Science": "Applied AI",
+    "Recommendation Systems": "Applied AI",
 }
 
 # ── PM Skills ─────────────────────────────────────────────────────────────────
