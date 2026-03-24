@@ -319,6 +319,32 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
         rate_limit_hits=0,
     )
 
+    # Best-effort: record run in reporium-api for the run-history endpoint
+    _finished_at = datetime.now(timezone.utc)
+    _started_at = datetime.fromtimestamp(start_time, tz=timezone.utc)
+    try:
+        async with httpx.AsyncClient(timeout=10) as _client:
+            _headers = {}
+            if settings.reporium_api_key:
+                _headers["Authorization"] = f"Bearer {settings.reporium_api_key}"
+            if settings.ingest_api_key:
+                _headers["X-Admin-Key"] = settings.ingest_api_key
+            await _client.post(
+                f"{settings.reporium_api_url.rstrip('/')}/admin/runs",
+                json={
+                    "run_mode": mode.value,
+                    "status": "success",
+                    "repos_upserted": repos_updated,
+                    "repos_processed": len(all_repos),
+                    "errors": [],
+                    "started_at": _started_at.isoformat(),
+                    "finished_at": _finished_at.isoformat(),
+                },
+                headers=_headers,
+            )
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("Could not record run in API: %s", _exc)
+
     console.rule()
     console.print(f'[green bold]✓ Complete in {elapsed:.0f}s[/green bold]')
     console.print(f'  API calls: {total_api_calls} (saved ~{max(0, len(all_repos)*5 - total_api_calls)} with cache)')
