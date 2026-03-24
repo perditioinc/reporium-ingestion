@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased] - 2026-03-24
+
+### Added
+- Claude enrichment prompt expanded to the live 8-dimension taxonomy flow.
+- SPDX license capture from the GitHub API is now forwarded in ingest payloads.
+- Pub/Sub publisher for repo-ingested events after successful batch completion.
+- Safer re-enrichment and repo-intake scripts with checkpoint/resume support.
+
+### Changed
+- Documentation now frames the March 2026 826-repo run as a historical milestone rather than current operating state.
+- Enrichment guidance is aligned to Claude-based summary/tag generation instead of older local-model references.
+
+### Fixed
+- Silent best-effort failures now emit structured warnings instead of disappearing.
+- Unused embedder allocation removed from the main ingestion path.
+
 ## [1.3.0] - 2026-03-23
 
 ### Added
