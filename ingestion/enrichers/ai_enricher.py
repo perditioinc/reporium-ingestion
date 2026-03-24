@@ -1,6 +1,6 @@
 """
 AI Enrichment using Claude API (claude-sonnet-4-20250514).
-One call per repo. Generates: readme_summary, problem_solved, categories, integration_tags.
+One call per repo. Generates 8 open taxonomy dimensions freely — no hardcoded skill lists.
 
 Cost: ~$4-5 total for 826 repos (~600 input + ~200 output tokens per call).
 Every call is logged to COST_LOG.md. Progress saved to RESUME.md every 50 repos.
@@ -21,39 +21,31 @@ import psycopg2
 
 logger = logging.getLogger(__name__)
 
-ENRICHMENT_PROMPT = """You are analyzing a GitHub repository to classify it for a knowledge graph of AI development tools.
+ENRICHMENT_PROMPT = """Analyze this AI/ML GitHub repository and return a JSON object with these fields:
 
-Given this repository information:
+Repository information:
 {repo_context}
 
-Respond with ONLY valid JSON, no markdown, no explanation:
 {{
   "readme_summary": "2-3 sentence plain language description of what this repo does and who uses it",
   "problem_solved": "1 sentence: what specific problem does this solve",
-  "categories": ["category1", "category2"],
-  "ai_dev_skills": ["skill1", "skill2"],
-  "lifecycleGroup": "Foundation & Training|Inference & Deployment|LLM Application Layer|Eval/Safety/Ops|Modality-Specific|Applied AI",
-  "integration_tags": ["tool1", "tool2"],
-  "quality_assessment": "high|medium|low"
+  "quality_assessment": "high|medium|low — based on documentation quality, activity, and stars",
+  "maturity_level": "research|prototype|beta|production",
+  "skill_areas": ["list of AI/ML expertise domains this repo demonstrates or requires — be specific and descriptive, generate as many as apply, e.g. 'Retrieval-Augmented Generation', 'LoRA Fine-tuning', 'Transformer Architecture'"],
+  "industries": ["industry verticals or domains this applies to — e.g. 'Healthcare', 'FinTech', 'Legal Tech', 'Developer Tools', 'Education', 'Robotics' — only include if genuinely applicable, omit if general-purpose"],
+  "use_cases": ["specific problems or applications this solves — e.g. 'Document Question Answering', 'Code Review Automation', 'Real-time Voice Transcription' — be concrete"],
+  "modalities": ["data types this works with — e.g. 'Text', 'Code', 'Image', 'Audio', 'Video', 'Tabular', 'Multimodal', '3D'"],
+  "ai_trends": ["current AI movements or paradigms this relates to — e.g. 'Agentic AI', 'Small Language Models', 'Compound AI Systems', 'AI Safety', 'Multimodal Reasoning', 'On-device AI'"],
+  "deployment_context": ["where/how this runs — e.g. 'Cloud API', 'Self-hosted', 'Edge/Mobile', 'Browser/WASM', 'On-premise', 'Serverless'"],
+  "integration_tags": ["specific frameworks, libraries, tools used — e.g. 'langchain', 'pytorch', 'huggingface', 'vllm', 'fastapi' — lowercase, specific"]
 }}
 
-Categories must only come from this list:
-agents, llm-serving, embeddings, vector-databases, evaluation, fine-tuning,
-rag, orchestration, observability, data-processing, ocr, vision, audio,
-code-generation, security, deployment, tooling, datasets, research, other
-
-ai_dev_skills must only come from this list of 28 skill areas (a repo can match multiple):
-Foundation & Training group: Foundation Model Architecture, Fine-tuning & Alignment, Data Engineering, Synthetic Data
-Inference & Deployment group: Inference & Serving, Model Compression, Edge AI
-LLM Application Layer group: Agents & Orchestration, RAG & Retrieval, Context Engineering, Tool Use, Structured Output, Prompt Engineering, Knowledge Graphs
-Eval/Safety/Ops group: Evaluation, Security & Guardrails, Observability, MLOps, AI Governance
-Modality-Specific group: Computer Vision, Speech & Audio, Generative Media, NLP, Multimodal
-Applied AI group: Coding Assistants, Robotics, AI for Science, Recommendation Systems
-
-lifecycleGroup must be the single best-matching group name from the 6 groups above.
-
-Integration tags are frameworks/tools this repo integrates with (e.g. langchain, openai, huggingface, fastapi).
-Maximum 5 integration tags. If unknown, use empty array."""
+Rules:
+- Generate as many values per field as genuinely apply — don't artificially limit
+- All values must be based on evidence in the README/description — no speculation
+- integration_tags: lowercase, specific library/tool names only
+- industries: omit entirely if the repo is general-purpose AI infrastructure
+- Return ONLY valid JSON, no markdown"""
 
 VALID_CATEGORIES = {
     "agents", "llm-serving", "embeddings", "vector-databases", "evaluation",
@@ -62,30 +54,21 @@ VALID_CATEGORIES = {
     "tooling", "datasets", "research", "other",
 }
 
-VALID_AI_DEV_SKILLS = {
-    # Foundation & Training
-    "Foundation Model Architecture", "Fine-tuning & Alignment", "Data Engineering", "Synthetic Data",
-    # Inference & Deployment
-    "Inference & Serving", "Model Compression", "Edge AI",
-    # LLM Application Layer
-    "Agents & Orchestration", "RAG & Retrieval", "Context Engineering", "Tool Use",
-    "Structured Output", "Prompt Engineering", "Knowledge Graphs",
-    # Eval/Safety/Ops
-    "Evaluation", "Security & Guardrails", "Observability", "MLOps", "AI Governance",
-    # Modality-Specific
-    "Computer Vision", "Speech & Audio", "Generative Media", "NLP", "Multimodal",
-    # Applied AI
-    "Coding Assistants", "Robotics", "AI for Science", "Recommendation Systems",
-}
+# VALID_AI_DEV_SKILLS and VALID_LIFECYCLE_GROUPS removed — taxonomy is now open/generative.
 
-VALID_LIFECYCLE_GROUPS = {
-    "Foundation & Training",
-    "Inference & Deployment",
-    "LLM Application Layer",
-    "Eval/Safety/Ops",
-    "Modality-Specific",
-    "Applied AI",
-}
+
+def _clean_list(values: list) -> list[str]:
+    """Strip whitespace, filter empty strings, deduplicate, preserve order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for v in values:
+        if not isinstance(v, str):
+            continue
+        v = v.strip()
+        if v and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
 
 
 @dataclass
@@ -97,6 +80,13 @@ class EnrichmentResult:
     categories: list[str] = field(default_factory=list)
     integration_tags: list[str] = field(default_factory=list)
     quality_assessment: str = "medium"
+    maturity_level: Optional[str] = None
+    skill_areas: list[str] = field(default_factory=list)
+    industries: list[str] = field(default_factory=list)
+    use_cases: list[str] = field(default_factory=list)
+    modalities: list[str] = field(default_factory=list)
+    ai_trends: list[str] = field(default_factory=list)
+    deployment_context: list[str] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
     error: Optional[str] = None
@@ -143,33 +133,35 @@ def _parse_enrichment_response(text: str) -> dict:
 
     data = json.loads(text)
 
-    # Validate categories
-    categories = data.get("categories", [])
-    valid = [c for c in categories if c in VALID_CATEGORIES]
-    if not valid and categories:
-        valid = ["other"]
-    data["categories"] = valid[:5]
+    # readme_summary and problem_solved — plain strings
+    data["readme_summary"] = data.get("readme_summary") or None
+    data["problem_solved"] = data.get("problem_solved") or None
 
-    # Validate ai_dev_skills (28-skill taxonomy)
-    raw_skills = data.get("ai_dev_skills", [])
-    valid_skills = [s for s in raw_skills if s in VALID_AI_DEV_SKILLS]
-    data["ai_dev_skills"] = valid_skills[:10]
-
-    # Validate lifecycleGroup
-    lifecycle = data.get("lifecycleGroup", "")
-    if lifecycle not in VALID_LIFECYCLE_GROUPS:
-        lifecycle = ""
-    data["lifecycleGroup"] = lifecycle
-
-    # Validate integration_tags
-    tags = data.get("integration_tags", [])
-    data["integration_tags"] = [t.lower().strip() for t in tags[:5]]
-
-    # Validate quality_assessment
+    # quality_assessment
     qa = data.get("quality_assessment", "medium")
     if qa not in ("high", "medium", "low"):
         qa = "medium"
     data["quality_assessment"] = qa
+
+    # maturity_level
+    ml = data.get("maturity_level", "")
+    if ml not in ("research", "prototype", "beta", "production"):
+        ml = None
+    data["maturity_level"] = ml
+
+    # Open list fields — no validation against any fixed set
+    data["skill_areas"] = _clean_list(data.get("skill_areas", []))
+    data["industries"] = _clean_list(data.get("industries", []))
+    data["use_cases"] = _clean_list(data.get("use_cases", []))
+    data["modalities"] = _clean_list(data.get("modalities", []))
+    data["ai_trends"] = _clean_list(data.get("ai_trends", []))
+    data["deployment_context"] = _clean_list(data.get("deployment_context", []))
+
+    # integration_tags — lowercase, deduplicated, no max limit
+    raw_tags = data.get("integration_tags", [])
+    data["integration_tags"] = _clean_list(
+        [t.lower() if isinstance(t, str) else t for t in raw_tags]
+    )
 
     return data
 
@@ -263,7 +255,7 @@ async def run_ai_enrichment(
 
             response = client.messages.create(
                 model=model,
-                max_tokens=500,
+                max_tokens=800,
                 messages=[{"role": "user", "content": prompt}],
             )
 
@@ -273,45 +265,36 @@ async def run_ai_enrichment(
             text = response.content[0].text
             data = _parse_enrichment_response(text)
 
-            # Write to database
+            # Write core fields to database
             cur.execute(
                 """UPDATE repos SET
                     readme_summary = %s,
                     problem_solved = %s,
-                    integration_tags = %s::jsonb
+                    integration_tags = %s::jsonb,
+                    quality_assessment = %s,
+                    maturity_level = %s,
+                    skill_areas = %s::jsonb,
+                    industries = %s::jsonb,
+                    use_cases = %s::jsonb,
+                    modalities = %s::jsonb,
+                    ai_trends = %s::jsonb,
+                    deployment_context = %s::jsonb
                 WHERE id = %s""",
                 (
                     data.get("readme_summary"),
                     data.get("problem_solved"),
                     json.dumps(data.get("integration_tags", [])),
+                    data.get("quality_assessment"),
+                    data.get("maturity_level"),
+                    json.dumps(data.get("skill_areas", [])),
+                    json.dumps(data.get("industries", [])),
+                    json.dumps(data.get("use_cases", [])),
+                    json.dumps(data.get("modalities", [])),
+                    json.dumps(data.get("ai_trends", [])),
+                    json.dumps(data.get("deployment_context", [])),
                     repo["id"],
                 ),
             )
-
-            # Write categories to junction table
-            categories = data.get("categories", [])
-            for j, cat in enumerate(categories):
-                cur.execute(
-                    """INSERT INTO repo_categories (repo_id, category_id, category_name, is_primary)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT DO NOTHING""",
-                    (
-                        repo["id"],
-                        cat,
-                        cat.replace("-", " ").title(),
-                        j == 0,
-                    ),
-                )
-
-            # Write ai_dev_skills from the 28-skill taxonomy
-            ai_dev_skills = data.get("ai_dev_skills", [])
-            for skill in ai_dev_skills:
-                cur.execute(
-                    """INSERT INTO repo_ai_dev_skills (repo_id, skill)
-                    VALUES (%s, %s)
-                    ON CONFLICT DO NOTHING""",
-                    (repo["id"], skill),
-                )
 
             conn.commit()
             stats.enriched += 1
