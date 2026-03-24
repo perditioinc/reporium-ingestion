@@ -193,7 +193,7 @@ CATEGORIES: list[dict] = [
     },
 ]
 
-# ── AI Dev Skills (28-skill taxonomy, 6 lifecycle groups) ─────────────────────
+# ── Lifecycle groups (reference documentation only — no longer used for validation) ──
 
 LIFECYCLE_GROUPS: list[str] = [
     "Foundation & Training",
@@ -204,74 +204,9 @@ LIFECYCLE_GROUPS: list[str] = [
     "Applied AI",
 ]
 
-AI_DEV_SKILLS: list[str] = [
-    # Foundation & Training
-    "Foundation Model Architecture",
-    "Fine-tuning & Alignment",
-    "Data Engineering",
-    "Synthetic Data",
-    # Inference & Deployment
-    "Inference & Serving",
-    "Model Compression",
-    "Edge AI",
-    # LLM Application Layer
-    "Agents & Orchestration",
-    "RAG & Retrieval",
-    "Context Engineering",
-    "Tool Use",
-    "Structured Output",
-    "Prompt Engineering",
-    "Knowledge Graphs",
-    # Eval/Safety/Ops
-    "Evaluation",
-    "Security & Guardrails",
-    "Observability",
-    "MLOps",
-    "AI Governance",
-    # Modality-Specific
-    "Computer Vision",
-    "Speech & Audio",
-    "Generative Media",
-    "NLP",
-    "Multimodal",
-    # Applied AI
-    "Coding Assistants",
-    "Robotics",
-    "AI for Science",
-    "Recommendation Systems",
-]
-
-# Mapping from skill area name to its lifecycle group
-SKILL_TO_LIFECYCLE_GROUP: dict[str, str] = {
-    "Foundation Model Architecture": "Foundation & Training",
-    "Fine-tuning & Alignment": "Foundation & Training",
-    "Data Engineering": "Foundation & Training",
-    "Synthetic Data": "Foundation & Training",
-    "Inference & Serving": "Inference & Deployment",
-    "Model Compression": "Inference & Deployment",
-    "Edge AI": "Inference & Deployment",
-    "Agents & Orchestration": "LLM Application Layer",
-    "RAG & Retrieval": "LLM Application Layer",
-    "Context Engineering": "LLM Application Layer",
-    "Tool Use": "LLM Application Layer",
-    "Structured Output": "LLM Application Layer",
-    "Prompt Engineering": "LLM Application Layer",
-    "Knowledge Graphs": "LLM Application Layer",
-    "Evaluation": "Eval/Safety/Ops",
-    "Security & Guardrails": "Eval/Safety/Ops",
-    "Observability": "Eval/Safety/Ops",
-    "MLOps": "Eval/Safety/Ops",
-    "AI Governance": "Eval/Safety/Ops",
-    "Computer Vision": "Modality-Specific",
-    "Speech & Audio": "Modality-Specific",
-    "Generative Media": "Modality-Specific",
-    "NLP": "Modality-Specific",
-    "Multimodal": "Modality-Specific",
-    "Coding Assistants": "Applied AI",
-    "Robotics": "Applied AI",
-    "AI for Science": "Applied AI",
-    "Recommendation Systems": "Applied AI",
-}
+# AI_DEV_SKILLS and SKILL_TO_LIFECYCLE_GROUP have been removed.
+# Taxonomy skill areas are now generated freely by the AI enricher (open taxonomy).
+# The assign_dimension() helper below still works against any dict you provide.
 
 # ── PM Skills ─────────────────────────────────────────────────────────────────
 

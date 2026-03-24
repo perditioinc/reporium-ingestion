@@ -10,7 +10,6 @@ from ingestion.enrichment.taxonomy import (
     assign_all_categories,
     assign_dimension,
     build_builder,
-    AI_DEV_SKILLS,
     PM_SKILLS,
     KNOWN_ORGS,
 )
@@ -252,12 +251,8 @@ def test_no_category_for_unrelated_tags():
 
 
 # ── Skill assignment ──────────────────────────────────────────────────────────
-
-def test_ai_dev_skills_assignment():
-    tags = ['vLLM', 'TGI', 'LLM Serving']
-    skills = assign_dimension(tags, AI_DEV_SKILLS)
-    assert 'Inference & Serving' in skills
-
+# AI_DEV_SKILLS has been removed — taxonomy is now open/generative (no fixed list).
+# assign_dimension() still works with any user-supplied dict (e.g. PM_SKILLS).
 
 def test_pm_skills_assignment():
     tags = ['AI Safety', 'Red Teaming', 'Prompt Injection']
@@ -265,14 +260,23 @@ def test_pm_skills_assignment():
     assert 'Safety & Alignment' in skills
 
 
-def test_multiple_skills():
+def test_pm_multiple_skills():
     tags = ['RAG', 'Vector Database', 'Docker', 'Evals', 'MLflow']
-    ai_skills = assign_dimension(tags, AI_DEV_SKILLS)
     pm_skills = assign_dimension(tags, PM_SKILLS)
-    assert 'RAG & Knowledge' in ai_skills
-    assert 'MLOps & Data' in ai_skills
     assert 'Data & Evaluation' in pm_skills
     assert 'Product Discovery' in pm_skills
+
+
+def test_assign_dimension_accepts_arbitrary_dict():
+    """assign_dimension works with any tag-to-dimension dict, not just fixed sets."""
+    custom_dim = {
+        'Speed': ['vLLM', 'TGI', 'batching'],
+        'Quality': ['Evals', 'benchmarking'],
+    }
+    tags = ['vLLM', 'Evals']
+    result = assign_dimension(tags, custom_dim)
+    assert 'Speed' in result
+    assert 'Quality' in result
 
 
 # ── Summarizer fallback ───────────────────────────────────────────────────────
