@@ -31,6 +31,8 @@ class FetchedRepo:
         self.parent_archived: bool = False
         self.dependencies: list[str] = []
         self.dep_source_file: str | None = None
+        self.has_tests: bool = False
+        self.has_ci: bool = False
 
 
 class RepoFetcher:
@@ -172,6 +174,24 @@ class RepoFetcher:
                     fetched.dependencies = parser(content)
                     fetched.dep_source_file = f'{target_owner}/{target_repo}/{filepath}'
                 break
+
+        # Detect has_tests and has_ci from repo tree (top-level paths only)
+        try:
+            branch = repo.default_branch or 'main'
+            paths = await self.client.get_tree_paths(repo.owner, repo.name, branch)
+            if not paths and branch != 'master':
+                paths = await self.client.get_tree_paths(repo.owner, repo.name, 'master')
+
+            test_indicators = {'test', 'tests', 'spec', 'specs', '__tests__', 'test_', 'pytest.ini', 'jest.config.js', 'jest.config.ts'}
+            ci_indicators = {'.github', '.circleci', '.travis.yml', 'Jenkinsfile', '.gitlab-ci.yml', 'azure-pipelines.yml'}
+
+            fetched.has_tests = any(
+                p.lower() in test_indicators or p.lower().startswith('test_')
+                for p in paths
+            )
+            fetched.has_ci = any(p in ci_indicators for p in paths)
+        except Exception:
+            pass  # Non-critical — has_tests/has_ci default to False
 
     async def _fetch_weekly(self, fetched: FetchedRepo) -> None:
         repo = fetched.github_repo

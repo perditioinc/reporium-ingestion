@@ -302,6 +302,18 @@ class GitHubClient:
                 return None
         return None
 
+    async def get_tree_paths(self, owner: str, repo: str, branch: str = 'main') -> list[str]:
+        """
+        Get top-level file/directory names in a repo tree (shallow — just root level).
+        Used for has_tests and has_ci detection. Returns [] on any error.
+        """
+        data = await self._request('GET', f'/repos/{owner}/{repo}/git/trees/{branch}', params={'recursive': '0'})
+        if not data or not isinstance(data, dict):
+            # Try 'master' if 'main' fails (handled by caller retry)
+            return []
+        tree = data.get('tree', [])
+        return [item.get('path', '') for item in tree if item.get('path')]
+
     async def get_rate_limit(self) -> RateLimitManager:
         data = await self._request('GET', '/rate_limit')
         if data:

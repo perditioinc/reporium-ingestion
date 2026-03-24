@@ -183,6 +183,8 @@ async def _to_api_payload(
         'deployment_context': [],
         'maturity_level': None,
         'quality_assessment': None,
+        'has_tests': fetched.has_tests,
+        'has_ci': fetched.has_ci,
         'integration_tags': [],
         'dependencies': fetched.dependencies,
         'license_spdx': fetched.github_repo.license_spdx,
