@@ -1,6 +1,7 @@
 # Reporium Ingestion — Cost Report
 
 **Date:** 2026-03-21
+**Status:** Historical snapshot of the March 2026 ingestion/backfill milestone
 **Repos processed:** 826
 
 ## Summary
@@ -9,7 +10,7 @@
 |-------|-------------|------|----------|
 | Phase 0 | Database audit, schema migration | $0.00 | 5 min |
 | Phase 1 | Dependency extraction from GitHub | $0.00 | 45 min |
-| Phase 2 | Claude API enrichment (826 repos) | **$2.52** | 78 min |
+| Phase 2 | Claude API enrichment (826 repos, historical run) | **$2.52** | 78 min |
 | Phase 3 | Embedding generation (sentence-transformers) | $0.00 | 62 sec |
 | Phase 4 | Knowledge graph edge building | $0.00 | 6 min |
 | Phase 5 | /intelligence/query endpoint | $0.00 | Deploy only |
@@ -44,8 +45,8 @@ At 100 queries/day = $1.20/day = ~$36/month
 
 ## What $2.52 Bought
 
-- 826 repos with AI-generated summaries, problem descriptions, and integration tags
-- 826 semantic embeddings for natural language search
+- 826 repos with AI-generated summaries, problem descriptions, and integration tags in the March 2026 run
+- 826 semantic embeddings for natural language search in the March 2026 run
 - 5,418 knowledge graph edges (compatibility, alternatives, dependencies)
 - A working /intelligence/query endpoint that answers natural language questions
 - Full database backfill: 14K tags, 2K pmSkills, 918 industries, 825 builders
@@ -61,3 +62,7 @@ At 100 queries/day = $1.20/day = ~$36/month
 | **Total** | **$4-5** | **$2.52** |
 
 49% under budget.
+
+## Current Usage Note
+
+Use this report as a dated milestone record. Current ingestion cost and corpus assumptions should be derived from current pipeline runs, not from this March 2026 snapshot.

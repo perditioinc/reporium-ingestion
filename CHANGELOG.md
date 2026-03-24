@@ -34,9 +34,9 @@
 ## [1.0.0] - 2026-03-21
 
 ### Added
-- Phase 1: Dependency extraction from GitHub (392/826 repos, $0)
-- Phase 2: Claude API enrichment with claude-sonnet-4-20250514 (826/826 repos, $2.52, 0 errors)
-- Phase 3: Sentence-transformer embeddings (826 x 384-dim, all-MiniLM-L6-v2, 62s, $0)
+- March 2026 milestone Phase 1: Dependency extraction from GitHub (392/826 repos, $0)
+- March 2026 milestone Phase 2: Claude API enrichment with claude-sonnet-4-20250514 (826/826 repos, $2.52, 0 errors)
+- March 2026 milestone Phase 3: Sentence-transformer embeddings (826 x 384-dim, all-MiniLM-L6-v2, 62s, $0)
 - Phase 4: Knowledge graph edges (5,418 edges: 1,988 COMPATIBLE_WITH, 3,000 ALTERNATIVE_TO, 430 DEPENDS_ON)
 - Phase 5: Semantic search verification (5 queries, all returning relevant results)
 - Phase 6: COST_REPORT.md and ARCHITECTURE_DECISIONS.md
