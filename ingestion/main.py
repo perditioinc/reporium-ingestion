@@ -169,7 +169,8 @@ async def _to_api_payload(
         'categories': categories_list,
         'builders': [builder],
         'pm_skills': pm_skills,
-        # Open taxonomy dimensions — populated by the AI enricher, not the tagger
+        # Open taxonomy dimensions — populated by the AI enricher, not the tagger.
+        # dependencies and license_spdx are fetched directly by the fetcher (no AI cost).
         'skill_areas': [],
         'industries': [],
         'use_cases': [],
@@ -179,6 +180,8 @@ async def _to_api_payload(
         'maturity_level': None,
         'quality_assessment': None,
         'integration_tags': [],
+        'dependencies': fetched.dependencies,
+        'license_spdx': fetched.github_repo.license_spdx,
         'languages': languages_list,
         'commits': commits_list,
     }
