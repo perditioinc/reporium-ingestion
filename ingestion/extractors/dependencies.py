@@ -30,6 +30,8 @@ DEPENDENCY_FILES = [
     "pyproject.toml",
     "package.json",
     "setup.py",
+    "go.mod",
+    "Cargo.toml",
 ]
 
 
@@ -114,11 +116,57 @@ def parse_setup_py(content: str) -> list[str]:
     return deps
 
 
+def parse_go_mod(content: str) -> list[str]:
+    """Parse module paths from go.mod require blocks."""
+    deps = []
+    in_require = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('require ('):
+            in_require = True
+            continue
+        if in_require:
+            if stripped == ')':
+                in_require = False
+                continue
+            # Format: github.com/some/pkg v1.2.3
+            parts = stripped.split()
+            if parts and not parts[0].startswith('//'):
+                deps.append(parts[0])
+        elif stripped.startswith('require ') and not stripped.startswith('require ('):
+            # Single-line: require github.com/some/pkg v1.2.3
+            parts = stripped[8:].split()
+            if parts:
+                deps.append(parts[0])
+    return deps
+
+
+def parse_cargo_toml(content: str) -> list[str]:
+    """Parse crate names from Cargo.toml [dependencies] section."""
+    deps = []
+    in_deps = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped in ('[dependencies]', '[dev-dependencies]', '[build-dependencies]'):
+            in_deps = True
+            continue
+        if stripped.startswith('[') and stripped != '[dependencies]':
+            in_deps = False
+            continue
+        if in_deps and '=' in stripped and not stripped.startswith('#'):
+            name = stripped.split('=')[0].strip()
+            if name:
+                deps.append(name)
+    return deps
+
+
 PARSERS = {
     "requirements.txt": parse_requirements_txt,
     "pyproject.toml": parse_pyproject_toml,
     "package.json": parse_package_json,
     "setup.py": parse_setup_py,
+    "go.mod": parse_go_mod,
+    "Cargo.toml": parse_cargo_toml,
 }
 
 
