@@ -1,8 +1,10 @@
 # Reporium Ingestion — Architecture Decisions
 
+This document records the architecture decisions made for the March 2026 ingestion and backfill milestone. Counts such as 826 repos refer to that historical run unless explicitly noted otherwise.
+
 ## Decision 1: Sentence-Transformers Over Paid Embedding APIs
 
-**Context:** Needed embeddings for 826 repos for semantic search.
+**Context:** March 2026 milestone run needed embeddings for 826 repos for semantic search.
 
 **Options:**
 1. OpenAI text-embedding-3-small — $0.02/1M tokens, ~$0.01 for 826 repos
@@ -17,7 +19,7 @@
 
 ## Decision 2: Claude Sonnet for Enrichment
 
-**Context:** Needed to generate readme_summary, problem_solved, and integration_tags for 826 repos.
+**Context:** March 2026 milestone needed to generate readme_summary, problem_solved, and integration_tags for 826 repos.
 
 **Options:**
 1. Claude Haiku — cheapest, fastest, less accurate
@@ -26,9 +28,9 @@
 
 **Decision:** claude-sonnet-4-20250514
 
-**Why:** Good quality at $0.003/repo. Total cost $2.52 for 826 repos. Haiku would save ~60% but integration tag quality matters for the knowledge graph. Opus would cost 5x more with marginal quality improvement for this use case.
+**Why:** Good quality at $0.003/repo. Total cost was $2.52 for the 826-repo March 2026 run. Haiku would save ~60% but integration tag quality matters for the knowledge graph. Opus would cost 5x more with marginal quality improvement for this use case.
 
-**Measured result:** 826/826 enriched, 0 errors, 613/826 with integration tags. OCR repos correctly tagged, ML frameworks correctly identified. Quality verified manually on 5 sample repos.
+**Measured result:** 826/826 enriched, 0 errors, 613/826 with integration tags during the March 2026 run. OCR repos correctly tagged, ML frameworks correctly identified. Quality verified manually on 5 sample repos.
 
 ## Decision 3: Knowledge Graph in PostgreSQL, Not Neo4j
 
@@ -79,3 +81,10 @@
 **Why:** Free, accurate, deterministic. If a repo doesn't have requirements.txt, it doesn't have known dependencies — that's honest. 392/826 repos (47%) had parseable dependency files. The missing 53% are repos without standard dependency manifests (awesome lists, docs, notebooks).
 
 **Tradeoff:** Misses dependencies declared in setup.py, pyproject.toml [tool.poetry], or Dockerfile. Could add parsers for these formats in a future iteration.
+
+Historical note: the dependency coverage ratio in this decision refers to the March 2026 826-repo milestone run, not the current live ingestion corpus.
+
+## Current Operating Guidance
+
+- Treat the counts above as a historical snapshot from March 2026, not as the current ingestion corpus size.
+- Current ingestion and backfill planning should use live counts from `reporium-db`, `reporium-api`, and current audit output instead of these milestone numbers.
