@@ -138,3 +138,41 @@ Operational checks after deployment:
 - confirm `POST /admin/runs` receives completed run records
 - confirm the `repo-ingested` Pub/Sub event is published when configured
 - confirm the downstream API refresh path updates taxonomy and portfolio intelligence
+
+## 7. Nightly Scheduling
+
+This repository now includes two operator-editable manifests:
+
+- `deploy/job.yaml`
+- `deploy/scheduler.yaml`
+
+Before applying them, replace the literal placeholders:
+
+- `PROJECT_ID`
+- `REGION`
+
+Apply the Cloud Run Job manifest first so the scheduler has a target:
+
+```bash
+gcloud run jobs replace deploy/job.yaml --region REGION
+```
+
+Then apply or translate the scheduler manifest into your preferred deployment path:
+
+```bash
+kubectl apply -f deploy/scheduler.yaml
+```
+
+If you do not use Config Connector, treat `deploy/scheduler.yaml` as the source-of-truth shape for creating the equivalent Cloud Scheduler job in GCP.
+
+Required IAM before enabling the scheduler:
+
+- the runtime service account must be able to read the referenced Secret Manager secrets
+- the scheduler service account `ingestion-scheduler@PROJECT_ID.iam.gserviceaccount.com` must be allowed to invoke Cloud Run Jobs
+- the deployment operator must be able to administer Cloud Run Jobs and Cloud Scheduler in the target project
+
+After both manifests are applied:
+
+- run the job once manually to verify the container image and secrets
+- verify Cloud Scheduler can obtain an OIDC token for the configured service account
+- confirm a successful scheduled run writes run history and emits the downstream refresh event
