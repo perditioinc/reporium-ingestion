@@ -225,12 +225,16 @@ async def run_ai_enrichment(
     conn = psycopg2.connect(db_url)
     cur = conn.cursor()
 
-    # Get repos needing enrichment (readme_summary IS NULL).
+    # Get repos needing enrichment.
+    # Use quality_signals IS NULL as the resume signal — readme_summary is populated
+    # by the lightweight summarizer during normal ingestion (1451/1460 repos already
+    # had summaries after recovery), so using it would skip nearly everything.
+    # quality_signals is only written by this enricher, so it's the correct sentinel.
     # Only select columns that actually exist in the production schema.
     cur.execute("""
         SELECT id, name, owner, description, primary_language, forked_from
         FROM repos
-        WHERE readme_summary IS NULL
+        WHERE quality_signals IS NULL
         ORDER BY name;
     """)
     columns = [d[0] for d in cur.description]
