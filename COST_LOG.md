@@ -17,3 +17,5 @@
 2026-03-21T04:01:00.318401+00:00 | enriched: 750/826 | errors: 0 | input_tokens: 253,763 | output_tokens: 101,734 | cost: $2.2873 (in: $0.7613 + out: $1.5260) | elapsed: 4338s
 2026-03-21T04:04:46.160069+00:00 | enriched: 800/826 | errors: 0 | input_tokens: 271,050 | output_tokens: 108,539 | cost: $2.4412 (in: $0.8132 + out: $1.6281) | elapsed: 4564s
 2026-03-21T04:06:40.961861+00:00 | enriched: 826/826 | errors: 0 | input_tokens: 279,788 | output_tokens: 112,126 | cost: $2.5213 (in: $0.8394 + out: $1.6819) | elapsed: 4679s
+2026-03-27T11:41:32.866475+00:00 | KAN-41 category backfill | enriched: 0/5 | errors: 5 | tokens: 0 in + 0 out | cost: $0.0000 (in: $0.0000 + out: $0.0000) | elapsed: 18s
+2026-03-27T11:42:07.894596+00:00 | KAN-41 category backfill | enriched: 0/5 | errors: 5 | tokens: 0 in + 0 out | cost: $0.0000 (in: $0.0000 + out: $0.0000) | elapsed: 18s
