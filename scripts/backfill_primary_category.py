@@ -56,7 +56,7 @@ VALID_CATEGORIES_SET = set(VALID_CATEGORIES)
 BATCH_SIZE = 10
 BATCH_DELAY = 1.0        # seconds between batches (rate limit courtesy)
 CHECKPOINT_EVERY = 50    # log cost every N repos
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-haiku-4-5"
 
 SLIM_PROMPT = """Given this AI/ML repository:
 Name: {name}
@@ -64,12 +64,13 @@ Description: {description}
 Summary: {readme_summary}
 Taxonomy: {taxonomy_dims}
 
-Assign exactly ONE primary_category from:
+You MUST assign exactly ONE primary_category chosen ONLY from this exact list (copy the string exactly):
 agents, rag-retrieval, llm-serving, fine-tuning, evaluation, orchestration, vector-databases, observability, security-safety, code-generation, data-processing, computer-vision, nlp-text, speech-audio, generative-media, infrastructure
 
-Also assign up to 3 secondary_categories from the same list (must differ from primary).
+Do NOT invent new category names. If unsure, pick the closest match from the list above.
+Also assign up to 3 secondary_categories from the same list (must differ from primary, exact strings only).
 
-Respond with JSON only: {{"primary_category": "...", "secondary_categories": ["..."]}}"""
+Respond with raw JSON only (no markdown, no explanation): {{"primary_category": "...", "secondary_categories": ["..."]}}"""
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -110,13 +111,15 @@ def build_prompt(repo: dict, taxonomy_rows: list[tuple]) -> str:
 
 def parse_response(text: str) -> dict | None:
     """Parse Claude's JSON, validate categories, return dict or None on failure."""
+    import re
     text = text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-        text = text.strip()
+    # Extract first JSON object (handles trailing commentary and markdown fences)
+    match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if not match:
+        logger.warning("No JSON object found | raw: %r", text[:200])
+        return None
     try:
-        data = json.loads(text)
+        data = json.loads(match.group())
     except json.JSONDecodeError as e:
         logger.warning("JSON parse error: %s | raw: %r", e, text[:200])
         return None
