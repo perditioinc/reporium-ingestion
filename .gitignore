@@ -30,3 +30,12 @@ htmlcov/
 *.pem
 *.key
 *.cert
+
+# Claude Code agent worktrees
+.claude/worktrees/
+
+# Script outputs and tmp files
+outputs/
+tmp-*.spec.*
+tmp-*.py
+scripts/reenrich_progress.db
