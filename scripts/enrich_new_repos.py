@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 DRY_RUN = "--dry-run" in sys.argv
 
 OWNER = "perditioinc"
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-haiku-4-5"
 GCP_PROJECT = os.getenv("GCP_PROJECT", "perditio-platform")
 
 
@@ -320,17 +320,9 @@ def run_dependency_extraction(conn, cur, repos: list[dict], token: str) -> None:
     for i, repo in enumerate(repos, 1):
         deps = extract_dependencies(token, repo)
         if deps:
-            try:
-                cur.execute(
-                    "UPDATE repos SET dependencies = %s::jsonb WHERE id = %s;",
-                    (json.dumps(deps), repo["id"]),
-                )
-                conn.commit()
-                repo["dependencies"] = deps
-                updated += 1
-            except Exception as e:
-                conn.rollback()
-                logger.warning(f"  Failed to save deps for {repo['name']}: {e}")
+            # Keep deps in-memory for embedding text; no 'dependencies' column in repos table
+            repo["dependencies"] = deps
+            updated += 1
 
         if i % 25 == 0:
             logger.info(f"  Deps progress: {i}/{len(repos)} ({updated} with deps)")
@@ -463,36 +455,44 @@ def run_ai_enrichment(conn, cur, repos: list[dict], api_key: str) -> dict:
 
             data = parse_enrichment_response(response.content[0].text)
 
-            # Update repos table with all taxonomy dimensions
+            # Update repos table — only valid columns
+            quality_signals = json.dumps({
+                "quality": data.get("quality_assessment"),
+                "maturity": data.get("maturity_level"),
+            })
             cur.execute(
                 """UPDATE repos SET
                     readme_summary = %s,
                     problem_solved = %s,
                     integration_tags = %s::jsonb,
-                    quality_assessment = %s,
-                    maturity_level = %s,
-                    skill_areas = %s::jsonb,
-                    industries = %s::jsonb,
-                    use_cases = %s::jsonb,
-                    modalities = %s::jsonb,
-                    ai_trends = %s::jsonb,
-                    deployment_context = %s::jsonb
+                    quality_signals = %s::jsonb
                 WHERE id = %s;""",
                 (
                     data.get("readme_summary"),
                     data.get("problem_solved"),
                     json.dumps(data.get("integration_tags", [])),
-                    data.get("quality_assessment"),
-                    data.get("maturity_level"),
-                    json.dumps(data.get("skill_areas", [])),
-                    json.dumps(data.get("industries", [])),
-                    json.dumps(data.get("use_cases", [])),
-                    json.dumps(data.get("modalities", [])),
-                    json.dumps(data.get("ai_trends", [])),
-                    json.dumps(data.get("deployment_context", [])),
+                    quality_signals,
                     repo["id"],
                 ),
             )
+
+            # Insert taxonomy dimensions into repo_taxonomy table
+            taxonomy_map = {
+                "skill_area": data.get("skill_areas", []),
+                "industry": data.get("industries", []),
+                "use_case": data.get("use_cases", []),
+                "modality": data.get("modalities", []),
+                "ai_trend": data.get("ai_trends", []),
+                "deployment_context": data.get("deployment_context", []),
+            }
+            for dimension, values in taxonomy_map.items():
+                for value in values:
+                    cur.execute(
+                        """INSERT INTO repo_taxonomy (repo_id, dimension, raw_value, assigned_by, created_at)
+                           VALUES (%s::uuid, %s, %s, 'ai_enricher', NOW())
+                           ON CONFLICT DO NOTHING;""",
+                        (repo["id"], dimension, value),
+                    )
 
             conn.commit()
             stats["enriched"] += 1
@@ -563,7 +563,7 @@ def run_embeddings(conn, cur, repos: list[dict], db_url: str) -> int:
     ids = [r["id"] for r in repos]
     cur.execute(
         """SELECT r.id, r.name, r.forked_from, r.description,
-                  r.readme_summary, r.problem_solved, r.integration_tags, r.dependencies
+                  r.readme_summary, r.problem_solved, r.integration_tags
            FROM repos r
            WHERE r.id = ANY(%s::uuid[]);""",
         (ids,),

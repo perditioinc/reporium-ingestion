@@ -49,7 +49,7 @@ def get_db_url() -> str:
 def build_embedding_text(row: dict) -> str:
     """
     Combine all enriched fields into a single text for embedding.
-    Fields: name, description, readme_summary, problem_solved, integration_tags, dependencies[:20]
+    Fields: name, description, readme_summary, problem_solved, integration_tags
     """
     parts = []
 
@@ -70,13 +70,6 @@ def build_embedding_text(row: dict) -> str:
             tags = json.loads(tags)
         if tags:
             parts.append("integrations: " + " ".join(tags))
-
-    deps = row.get("dependencies")
-    if deps:
-        if isinstance(deps, str):
-            deps = json.loads(deps)
-        if deps:
-            parts.append("dependencies: " + " ".join(deps[:20]))
 
     return " ".join(parts)[:2048]  # model max input
 
@@ -105,7 +98,7 @@ def main():
     # Get all repos that need embeddings
     cur.execute("""
         SELECT r.id, r.name, r.forked_from, r.description,
-               r.readme_summary, r.problem_solved, r.integration_tags, r.dependencies
+               r.readme_summary, r.problem_solved, r.integration_tags
         FROM repos r
         LEFT JOIN repo_embeddings e ON r.id = e.repo_id
         WHERE e.repo_id IS NULL
