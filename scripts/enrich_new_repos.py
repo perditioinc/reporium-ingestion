@@ -36,6 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DRY_RUN = "--dry-run" in sys.argv
+REENRICH_MISSING = "--reenrich-missing" in sys.argv
 
 OWNER = "perditioinc"
 MODEL = "claude-haiku-4-5"
@@ -635,6 +636,79 @@ def rebuild_knowledge_graph(conn, cur) -> None:
         logger.info("  Knowledge graph rebuild complete")
 
 
+# ── Re-enrich missing ─────────────────────────────────────────────────────────
+
+def reenrich_missing_main():
+    """
+    --reenrich-missing: Run Phase 3 + 4 on repos WHERE readme_summary IS NULL.
+    Skips Phases 0-2 (no insert, no dep extraction). Cheap targeted backfill.
+    """
+    import psycopg2
+
+    t_start = time.monotonic()
+    logger.info("=" * 60)
+    logger.info("Reporium: Re-enrich repos missing readme_summary")
+    logger.info("=" * 60)
+
+    db_url = get_db_url()
+    api_key = get_anthropic_key()
+
+    conn = psycopg2.connect(db_url)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, name, owner, description, primary_language, forked_from, github_url
+        FROM repos
+        WHERE readme_summary IS NULL
+        ORDER BY ingested_at DESC;
+    """)
+    cols = [d[0] for d in cur.description]
+    repos = [dict(zip(cols, row)) for row in cur.fetchall()]
+    # Cast id to str for consistency with insert path
+    for r in repos:
+        r["id"] = str(r["id"])
+
+    if not repos:
+        logger.info("No repos missing readme_summary — nothing to do.")
+        conn.close()
+        return
+
+    logger.info(f"Repos missing readme_summary: {len(repos)}")
+    for r in repos:
+        logger.info(f"  - {r['owner']}/{r['name']}")
+
+    # Phase 3: AI enrichment
+    ai_stats = run_ai_enrichment(conn, cur, repos, api_key)
+
+    # Phase 4: Embeddings (only for repos that got enriched this run)
+    enriched_repos = [r for r in repos if r.get("readme_summary")]
+    emb_count = 0
+    if enriched_repos:
+        emb_count = run_embeddings(conn, cur, enriched_repos, db_url)
+
+    elapsed = time.monotonic() - t_start
+    input_cost = ai_stats["input_tokens"] / 1_000_000 * 3.0
+    output_cost = ai_stats["output_tokens"] / 1_000_000 * 15.0
+
+    cur.execute("SELECT COUNT(*) FROM repos WHERE readme_summary IS NULL;")
+    still_missing = cur.fetchone()[0]
+
+    print()
+    print("=" * 60)
+    print("RE-ENRICH COMPLETE")
+    print("=" * 60)
+    print(f"  Targeted:             {len(repos)}")
+    print(f"  Enriched:             {ai_stats['enriched']}")
+    print(f"  Errors:               {ai_stats['errors']}")
+    print(f"  Embeddings generated: {emb_count}")
+    print(f"  AI cost:              ${input_cost + output_cost:.4f}")
+    print(f"  Elapsed:              {elapsed:.0f}s")
+    print(f"  Still missing:        {still_missing}")
+    print()
+
+    conn.close()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -751,4 +825,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if REENRICH_MISSING:
+        reenrich_missing_main()
+    else:
+        main()
