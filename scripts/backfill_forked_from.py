@@ -29,17 +29,32 @@ DRY_RUN = "--dry-run" in sys.argv
 GCP_PROJECT = os.getenv("GCP_PROJECT", "perditio-platform")
 
 
+def _normalize_db_url(url: str) -> str:
+    import urllib.parse
+    url = url.replace("+asyncpg", "").replace("+psycopg2", "")
+    parsed = urllib.parse.urlsplit(url)
+    params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    ssl_val = params.pop("ssl", [None])[0]
+    if ssl_val and "sslmode" not in params:
+        if ssl_val.lower() in ("true", "1", "require"):
+            params["sslmode"] = ["require"]
+        elif ssl_val.lower() in ("false", "0", "disable"):
+            params["sslmode"] = ["disable"]
+    new_query = urllib.parse.urlencode({k: v[0] for k, v in params.items()})
+    return urllib.parse.urlunsplit(parsed._replace(query=new_query))
+
+
 def get_db_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     if url:
-        return url.replace("+asyncpg", "").replace("+psycopg2", "")
+        return _normalize_db_url(url)
     try:
         from google.cloud import secretmanager
         client = secretmanager.SecretManagerServiceClient()
         name = f"projects/{GCP_PROJECT}/secrets/reporium-db-url-async/versions/latest"
         response = client.access_secret_version(request={"name": name})
         raw = response.payload.data.decode("UTF-8").strip()
-        return raw.replace("+asyncpg", "").replace("+psycopg2", "")
+        return _normalize_db_url(raw)
     except Exception as e:
         raise RuntimeError(f"No DATABASE_URL: {e}")
 
