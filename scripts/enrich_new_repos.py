@@ -36,9 +36,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DRY_RUN = "--dry-run" in sys.argv
+REENRICH_MISSING = "--reenrich-missing" in sys.argv
 
 OWNER = "perditioinc"
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-haiku-4-5"
 GCP_PROJECT = os.getenv("GCP_PROJECT", "perditio-platform")
 
 
@@ -320,17 +321,9 @@ def run_dependency_extraction(conn, cur, repos: list[dict], token: str) -> None:
     for i, repo in enumerate(repos, 1):
         deps = extract_dependencies(token, repo)
         if deps:
-            try:
-                cur.execute(
-                    "UPDATE repos SET dependencies = %s::jsonb WHERE id = %s;",
-                    (json.dumps(deps), repo["id"]),
-                )
-                conn.commit()
-                repo["dependencies"] = deps
-                updated += 1
-            except Exception as e:
-                conn.rollback()
-                logger.warning(f"  Failed to save deps for {repo['name']}: {e}")
+            # Keep deps in-memory for embedding text; no 'dependencies' column in repos table
+            repo["dependencies"] = deps
+            updated += 1
 
         if i % 25 == 0:
             logger.info(f"  Deps progress: {i}/{len(repos)} ({updated} with deps)")
@@ -463,36 +456,44 @@ def run_ai_enrichment(conn, cur, repos: list[dict], api_key: str) -> dict:
 
             data = parse_enrichment_response(response.content[0].text)
 
-            # Update repos table with all taxonomy dimensions
+            # Update repos table — only valid columns
+            quality_signals = json.dumps({
+                "quality": data.get("quality_assessment"),
+                "maturity": data.get("maturity_level"),
+            })
             cur.execute(
                 """UPDATE repos SET
                     readme_summary = %s,
                     problem_solved = %s,
                     integration_tags = %s::jsonb,
-                    quality_assessment = %s,
-                    maturity_level = %s,
-                    skill_areas = %s::jsonb,
-                    industries = %s::jsonb,
-                    use_cases = %s::jsonb,
-                    modalities = %s::jsonb,
-                    ai_trends = %s::jsonb,
-                    deployment_context = %s::jsonb
+                    quality_signals = %s::jsonb
                 WHERE id = %s;""",
                 (
                     data.get("readme_summary"),
                     data.get("problem_solved"),
                     json.dumps(data.get("integration_tags", [])),
-                    data.get("quality_assessment"),
-                    data.get("maturity_level"),
-                    json.dumps(data.get("skill_areas", [])),
-                    json.dumps(data.get("industries", [])),
-                    json.dumps(data.get("use_cases", [])),
-                    json.dumps(data.get("modalities", [])),
-                    json.dumps(data.get("ai_trends", [])),
-                    json.dumps(data.get("deployment_context", [])),
+                    quality_signals,
                     repo["id"],
                 ),
             )
+
+            # Insert taxonomy dimensions into repo_taxonomy table
+            taxonomy_map = {
+                "skill_area": data.get("skill_areas", []),
+                "industry": data.get("industries", []),
+                "use_case": data.get("use_cases", []),
+                "modality": data.get("modalities", []),
+                "ai_trend": data.get("ai_trends", []),
+                "deployment_context": data.get("deployment_context", []),
+            }
+            for dimension, values in taxonomy_map.items():
+                for value in values:
+                    cur.execute(
+                        """INSERT INTO repo_taxonomy (repo_id, dimension, raw_value, assigned_by, created_at)
+                           VALUES (%s::uuid, %s, %s, 'ai_enricher', NOW())
+                           ON CONFLICT DO NOTHING;""",
+                        (repo["id"], dimension, value),
+                    )
 
             conn.commit()
             stats["enriched"] += 1
@@ -563,7 +564,7 @@ def run_embeddings(conn, cur, repos: list[dict], db_url: str) -> int:
     ids = [r["id"] for r in repos]
     cur.execute(
         """SELECT r.id, r.name, r.forked_from, r.description,
-                  r.readme_summary, r.problem_solved, r.integration_tags, r.dependencies
+                  r.readme_summary, r.problem_solved, r.integration_tags
            FROM repos r
            WHERE r.id = ANY(%s::uuid[]);""",
         (ids,),
@@ -633,6 +634,79 @@ def rebuild_knowledge_graph(conn, cur) -> None:
         logger.warning(f"  Knowledge graph script exited with code {result.returncode}")
     else:
         logger.info("  Knowledge graph rebuild complete")
+
+
+# ── Re-enrich missing ─────────────────────────────────────────────────────────
+
+def reenrich_missing_main():
+    """
+    --reenrich-missing: Run Phase 3 + 4 on repos WHERE readme_summary IS NULL.
+    Skips Phases 0-2 (no insert, no dep extraction). Cheap targeted backfill.
+    """
+    import psycopg2
+
+    t_start = time.monotonic()
+    logger.info("=" * 60)
+    logger.info("Reporium: Re-enrich repos missing readme_summary")
+    logger.info("=" * 60)
+
+    db_url = get_db_url()
+    api_key = get_anthropic_key()
+
+    conn = psycopg2.connect(db_url)
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, name, owner, description, primary_language, forked_from, github_url
+        FROM repos
+        WHERE readme_summary IS NULL
+        ORDER BY ingested_at DESC;
+    """)
+    cols = [d[0] for d in cur.description]
+    repos = [dict(zip(cols, row)) for row in cur.fetchall()]
+    # Cast id to str for consistency with insert path
+    for r in repos:
+        r["id"] = str(r["id"])
+
+    if not repos:
+        logger.info("No repos missing readme_summary — nothing to do.")
+        conn.close()
+        return
+
+    logger.info(f"Repos missing readme_summary: {len(repos)}")
+    for r in repos:
+        logger.info(f"  - {r['owner']}/{r['name']}")
+
+    # Phase 3: AI enrichment
+    ai_stats = run_ai_enrichment(conn, cur, repos, api_key)
+
+    # Phase 4: Embeddings (only for repos that got enriched this run)
+    enriched_repos = [r for r in repos if r.get("readme_summary")]
+    emb_count = 0
+    if enriched_repos:
+        emb_count = run_embeddings(conn, cur, enriched_repos, db_url)
+
+    elapsed = time.monotonic() - t_start
+    input_cost = ai_stats["input_tokens"] / 1_000_000 * 3.0
+    output_cost = ai_stats["output_tokens"] / 1_000_000 * 15.0
+
+    cur.execute("SELECT COUNT(*) FROM repos WHERE readme_summary IS NULL;")
+    still_missing = cur.fetchone()[0]
+
+    print()
+    print("=" * 60)
+    print("RE-ENRICH COMPLETE")
+    print("=" * 60)
+    print(f"  Targeted:             {len(repos)}")
+    print(f"  Enriched:             {ai_stats['enriched']}")
+    print(f"  Errors:               {ai_stats['errors']}")
+    print(f"  Embeddings generated: {emb_count}")
+    print(f"  AI cost:              ${input_cost + output_cost:.4f}")
+    print(f"  Elapsed:              {elapsed:.0f}s")
+    print(f"  Still missing:        {still_missing}")
+    print()
+
+    conn.close()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -751,4 +825,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if REENRICH_MISSING:
+        reenrich_missing_main()
+    else:
+        main()
