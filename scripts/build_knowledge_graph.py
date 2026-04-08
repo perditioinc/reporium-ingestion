@@ -99,7 +99,7 @@ def build_compatible_with(cur):
     tags_list = list(tag_to_repos.keys())
     for tag in tags_list:
         repos = tag_to_repos[tag]
-        if len(repos) > 100:
+        if len(repos) > 300:
             # Skip very common tags to avoid O(n²) blowup
             continue
         for r1, r2 in combinations(repos, 2):
@@ -126,7 +126,7 @@ def build_compatible_with(cur):
                     "target_name": r2["forked_from"] or r2["name"],
                 })
         # Cap at 5000 edges to keep manageable
-        if len(edges) >= 5000:
+        if len(edges) >= 15000:
             break
 
     logger.info(f"  COMPATIBLE_WITH edges found: {len(edges)}")
@@ -217,8 +217,8 @@ def build_alternative_to(cur):
 
     edges = []
     seen = set()
-    MAX_EDGES = 3000
-    MAX_PER_CATEGORY = 50  # Only compare top repos in each category
+    MAX_EDGES = 15000
+    MAX_PER_CATEGORY = 200  # Compare more repos in each category
     for cat, repos in cat_repos.items():
         if len(repos) < 2:
             continue
@@ -252,6 +252,15 @@ def build_depends_on(cur):
     Match dependency names against repo names (case-insensitive).
     """
     logger.info("Building DEPENDS_ON edges...")
+
+    # Check if dependencies column exists
+    cur.execute("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'repos' AND column_name = 'dependencies'
+    """)
+    if not cur.fetchone():
+        logger.info("  dependencies column not found — skipping DEPENDS_ON")
+        return []
 
     # Get all repos with dependencies
     cur.execute("""
@@ -313,20 +322,30 @@ def build_depends_on(cur):
 
 
 def insert_edges(cur, edges, edge_type):
-    """Insert edges into repo_edges table."""
+    """Insert edges into repo_edges table using batch inserts."""
     inserted = 0
-    for e in edges:
+    BATCH = 500
+    for i in range(0, len(edges), BATCH):
+        batch = edges[i:i + BATCH]
+        values = []
+        params = []
+        for j, e in enumerate(batch):
+            off = j * 5
+            values.append(f"(%s, %s, %s, %s, %s)")
+            params.extend([str(e["source"]), str(e["target"]), edge_type, e["weight"], json.dumps(e["evidence"])])
+        sql = (
+            "INSERT INTO repo_edges (source_repo_id, target_repo_id, edge_type, weight, evidence) VALUES "
+            + ", ".join(values)
+            + " ON CONFLICT (source_repo_id, target_repo_id, edge_type) DO UPDATE SET"
+            + " weight = EXCLUDED.weight, evidence = EXCLUDED.evidence"
+        )
         try:
-            cur.execute("""
-                INSERT INTO repo_edges (source_repo_id, target_repo_id, edge_type, weight, evidence)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (source_repo_id, target_repo_id, edge_type) DO UPDATE SET
-                    weight = EXCLUDED.weight,
-                    evidence = EXCLUDED.evidence;
-            """, (str(e["source"]), str(e["target"]), edge_type, e["weight"], json.dumps(e["evidence"])))
-            inserted += 1
+            cur.execute(sql, params)
+            inserted += len(batch)
         except Exception as ex:
-            logger.warning(f"  Failed to insert edge: {ex}")
+            logger.warning(f"  Batch insert failed: {ex}")
+        if (i + BATCH) % 5000 == 0 or i + BATCH >= len(edges):
+            logger.info(f"  {edge_type}: inserted {inserted}/{len(edges)}")
     return inserted
 
 
