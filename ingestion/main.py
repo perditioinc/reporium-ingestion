@@ -168,7 +168,16 @@ async def _to_api_payload(
         'commits_last_30_days': commit_stats['last30Days'],
         'commits_last_90_days': commit_stats['last90Days'],
         'readme_summary': summary,
-        'activity_score': min(100, commit_stats['last30Days'] * 5 + commit_stats['last7Days'] * 10),
+        'activity_score': min(100, (
+            # Commit velocity (up to 60 pts): 30d commits × 3 + 7d commits × 5
+            commit_stats['last30Days'] * 3 + commit_stats['last7Days'] * 5
+            # Popularity signal (up to 20 pts): log-scaled stars
+            + min(20, int(__import__('math').log(max(1, repo.stars or 0) + 1, 2) * 2))
+            # Community engagement (up to 10 pts): open issues capped
+            + min(10, (repo.open_issues_count or 0))
+            # Recency bonus (10 pts): has any commits in 90d
+            + (10 if commit_stats['last90Days'] > 0 else 0)
+        )),
         'tags': tags,
         'categories': categories_list,
         'builders': [builder],
