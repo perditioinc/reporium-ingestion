@@ -28,10 +28,10 @@ spec:
                     secretKeyRef:
                       name: GITHUB_TOKEN
                       key: latest
-                - name: OPENAI_API_KEY
+                - name: ANTHROPIC_API_KEY
                   valueFrom:
                     secretKeyRef:
-                      name: OPENAI_API_KEY
+                      name: anthropic-api-key
                       key: latest
                 - name: REPORIUM_API_URL
                   valueFrom:
