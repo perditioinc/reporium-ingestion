@@ -39,6 +39,7 @@ from .enrichment.summarizer import RepoSummarizer
 from .api.client import ReporiumAPIClient
 from .analysis.trends import build_trend_snapshot
 from .analysis.gaps import detect_gaps
+from .extractors.dependencies import FILE_TO_ECOSYSTEM
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -196,6 +197,11 @@ async def _to_api_payload(
         'has_ci': fetched.has_ci,
         'integration_tags': [],
         'dependencies': fetched.dependencies,
+        # Derive ecosystem from the source file so the API can tag repo_dependencies rows correctly.
+        'dep_ecosystem': (
+            FILE_TO_ECOSYSTEM.get(fetched.dep_source_file.split('/')[-1])
+            if fetched.dep_source_file else None
+        ),
         'license_spdx': fetched.github_repo.license_spdx,
         'languages': languages_list,
         'commits': commits_list,
