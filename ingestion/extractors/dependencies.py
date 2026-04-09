@@ -4,10 +4,12 @@ This is free — only uses GitHub API with existing GH_TOKEN.
 Cost: $0
 
 For each repo, fetches requirements.txt / pyproject.toml / package.json from GitHub,
-parses package names (not versions), and stores as JSON array in the dependencies column.
+parses package names (not versions), and inserts into the repo_dependencies table.
 
-If no dependency file is found: stores [] (empty array) — marks it as "checked, no deps found".
-If GitHub API returns 404 for all files: stores [].
+Previously wrote to repos.dependencies JSONB column, which was dropped in migration 014.
+Now targets the repo_dependencies table created in migration 029.
+
+If no dependency file is found: no rows are inserted — the repo is simply not re-queued.
 If GitHub API rate limits: pauses and retries once, then skips.
 """
 
@@ -34,6 +36,16 @@ DEPENDENCY_FILES = [
     "Cargo.toml",
 ]
 
+# Map source filename → package ecosystem identifier
+FILE_TO_ECOSYSTEM: dict[str, str] = {
+    "requirements.txt": "pypi",
+    "pyproject.toml": "pypi",
+    "setup.py": "pypi",
+    "package.json": "npm",
+    "go.mod": "go",
+    "Cargo.toml": "cargo",
+}
+
 
 @dataclass
 class ExtractionResult:
@@ -41,6 +53,7 @@ class ExtractionResult:
     repo_name: str
     dependencies: list[str]
     source_file: Optional[str]
+    ecosystem: Optional[str]
     error: Optional[str] = None
 
 
@@ -178,7 +191,6 @@ async def fetch_file_content(
     token: str,
 ) -> Optional[str]:
     """Fetch a file from GitHub API. Returns content or None if not found."""
-    # Use the upstream repo if it's a fork (forked_from)
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filepath}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3.raw"}
     try:
@@ -188,7 +200,6 @@ async def fetch_file_content(
         if resp.status_code == 404:
             return None
         if resp.status_code == 403:
-            # Rate limited
             remaining = int(resp.headers.get("x-ratelimit-remaining", "0"))
             if remaining == 0:
                 logger.warning("Rate limited on %s/%s/%s", owner, repo, filepath)
@@ -211,7 +222,6 @@ async def extract_dependencies_for_repo(
     Extract dependencies for a single repo.
     Tries upstream repo if it's a fork, falls back to fork itself.
     """
-    # If it's a fork, try the upstream first (more likely to have deps)
     targets = []
     if forked_from:
         parts = forked_from.split("/")
@@ -226,43 +236,49 @@ async def extract_dependencies_for_repo(
                 parser = PARSERS.get(filepath)
                 if parser:
                     deps = parser(content)
+                    ecosystem = FILE_TO_ECOSYSTEM.get(filepath)
                     return ExtractionResult(
                         repo_id=repo_id,
                         repo_name=f"{owner}/{repo_name}",
                         dependencies=deps,
                         source_file=f"{target_owner}/{target_repo}/{filepath}",
+                        ecosystem=ecosystem,
                     )
 
-    # No dependency file found — return empty (checked, no deps)
     return ExtractionResult(
         repo_id=repo_id,
         repo_name=f"{owner}/{repo_name}",
         dependencies=[],
         source_file=None,
+        ecosystem=None,
     )
 
 
 async def run_dependency_extraction(db_url: str, gh_token: str) -> dict:
     """
-    Main entry point: extract dependencies for all repos with null dependencies.
+    Main entry point: extract dependencies for repos not yet in repo_dependencies.
+    Writes to repo_dependencies table (migration 029).
     Returns summary dict.
+
+    Repos with no dependency file found are not inserted — they will be re-queued
+    on the next run. This is acceptable: GitHub API calls are cheap and the table
+    is the canonical "has deps" signal, not a "was checked" sentinel.
     """
     conn = psycopg2.connect(db_url)
     cur = conn.cursor()
 
-    # Get repos that haven't been checked yet.
-    # NULL = not yet checked. After extraction:
-    #   [] = checked, no deps found
-    #   ["pkg1", "pkg2"] = checked, deps found
+    # Find repos that have no rows in repo_dependencies yet.
+    # LEFT JOIN: repos where rd.repo_id IS NULL have never had deps extracted.
     cur.execute("""
-        SELECT id, name, owner, forked_from
-        FROM repos
-        WHERE dependencies IS NULL
-        ORDER BY name;
+        SELECT r.id, r.name, r.owner, r.forked_from
+        FROM repos r
+        LEFT JOIN repo_dependencies rd ON rd.repo_id = r.id
+        WHERE rd.repo_id IS NULL
+        ORDER BY r.name;
     """)
     repos = cur.fetchall()
     total = len(repos)
-    logger.info("Found %d repos with null dependencies to process", total)
+    logger.info("Found %d repos with no repo_dependencies entries", total)
 
     if total == 0:
         conn.close()
@@ -285,27 +301,35 @@ async def run_dependency_extraction(db_url: str, gh_token: str) -> dict:
                     errors += 1
                     logger.warning("Error for %s: %s", result.repo_name, result.error)
                 else:
-                    deps_json = json.dumps(result.dependencies)
-                    cur.execute(
-                        "UPDATE repos SET dependencies = %s::jsonb WHERE id = %s",
-                        (deps_json, repo_id),
-                    )
-                    conn.commit()
-                    processed += 1
-
                     if result.dependencies:
+                        # Delete any stale rows first (idempotent on re-run)
+                        cur.execute(
+                            "DELETE FROM repo_dependencies WHERE repo_id = %s",
+                            (repo_id,),
+                        )
+                        for pkg in result.dependencies:
+                            cur.execute(
+                                """
+                                INSERT INTO repo_dependencies
+                                    (repo_id, package_name, package_ecosystem, is_direct)
+                                VALUES (%s, %s, %s, true)
+                                ON CONFLICT (repo_id, package_name, package_ecosystem)
+                                    DO NOTHING
+                                """,
+                                (repo_id, pkg, result.ecosystem),
+                            )
+                        conn.commit()
                         with_deps += 1
                     else:
                         no_deps += 1
+                    processed += 1
 
-                # Progress logging every 50 repos
                 if (i + 1) % 50 == 0:
                     logger.info(
                         "Progress: %d/%d (with deps: %d, no deps: %d, errors: %d)",
                         i + 1, total, with_deps, no_deps, errors,
                     )
 
-                # Rate limit: 500ms delay between requests
                 await asyncio.sleep(0.5)
 
     conn.close()
