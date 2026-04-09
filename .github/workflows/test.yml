@@ -49,13 +49,29 @@ jobs:
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
           pip install pytest psycopg2-binary
+
+      - name: Checkout reporium-api for migrations
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: perditioinc/reporium-api
+          path: _reporium_api
+
+      - name: Install reporium-api dependencies and run migrations
+        run: |
+          pip install -r _reporium_api/requirements.txt
+          cd _reporium_api
+          DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test \
+            alembic upgrade head
+
       - name: Run integration tests
         run: pytest tests/test_knowledge_graph.py -v
         timeout-minutes: 5
