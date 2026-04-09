@@ -1,10 +1,9 @@
 name: Nightly Graph Build
 
 on:
-  # Run after the nightly enrichment workflow completes
-  workflow_run:
-    workflows: ["Nightly Enrichment"]
-    types: [completed]
+  # 8:30 UTC daily — 90 min after nightly enrichment starts at 07:00 UTC
+  schedule:
+    - cron: "30 8 * * *"
   # Also allow manual trigger for on-demand rebuilds
   workflow_dispatch:
     inputs:
@@ -12,6 +11,10 @@ on:
         description: "ingest_runs.id to tag edges with (optional)"
         required: false
         default: ""
+      resume_crashed_run:
+        description: "Resume a crashed run (1 = yes)"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -19,10 +22,7 @@ permissions:
 jobs:
   build-graph:
     runs-on: ubuntu-latest
-    # Only run if the triggering enrichment workflow succeeded (or on manual dispatch)
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+    if: always()
 
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +38,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           INGEST_RUN_ID: ${{ github.event.inputs.ingest_run_id || '' }}
+          RESUME_CRASHED_RUN: ${{ github.event.inputs.resume_crashed_run || '1' }}
         run: python scripts/build_knowledge_graph.py
 
       - name: Report edge counts
