@@ -1,6 +1,22 @@
 """
-Build knowledge graph edges from enriched repo data.
-Cost: $0 — uses existing data only.
+Phase 4: Build knowledge graph edges — atomic rebuild with crash recovery.
+
+Supersedes the previous direct-psycopg2 implementation.
+
+Architecture:
+  1. Edges are built into a staging table (repo_edges_staging_{run_id}).
+  2. Edge counts are validated against the previous run (warn >20% drop, abort >50%
+     or any type with >100 prior edges drops to zero).
+  3. A single locked transaction: archive → truncate → swap from staging → drop staging.
+  4. Crash BEFORE the LOCK leaves live repo_edges untouched.
+  5. Progress is checkpointed to ingest_runs.checkpoint_data for resume after crash.
+
+Requires:
+  - repo_edges + repo_edges_history tables (migration 033 in reporium-api)
+  - ingest_runs extended columns: checkpoint_data, prev_edge_counts, git_sha,
+    triggered_by (migration 032 in reporium-api)
+
+(Previous build notes below — kept for historical reference)
 
 Edge types:
   COMPATIBLE_WITH — repos sharing 2+ integration tags
@@ -388,13 +404,12 @@ def insert_edges(cur, edges, edge_type):
             ])
         sql = (
             "INSERT INTO repo_edges "
-            "(source_repo_id, target_repo_id, edge_type, weight, confidence, evidence) "
+            "(source_repo_id, target_repo_id, edge_type, weight, confidence, metadata) "
             "VALUES " + ", ".join(values)
             + " ON CONFLICT (source_repo_id, target_repo_id, edge_type) DO UPDATE SET"
             " weight = EXCLUDED.weight,"
             " confidence = EXCLUDED.confidence,"
-            " evidence = EXCLUDED.evidence,"
-            " updated_at = NOW()"
+            " metadata = EXCLUDED.metadata"
         )
         try:
             cur.execute(sql, params)
@@ -407,97 +422,111 @@ def insert_edges(cur, edges, edge_type):
 
 
 def record_history(cur, edge_counts: dict, run_id: int | None = None):
-    """Record edge counts in repo_edges_history for velocity tracking."""
-    for edge_type, count in edge_counts.items():
+    """Record edge counts for velocity tracking.
+
+    Writes to ingest_runs.prev_edge_counts if the table supports it,
+    otherwise logs the counts. Full edge history is archived by
+    atomic_swap into repo_edges_history.
+    """
+    try:
         cur.execute(
-            """INSERT INTO repo_edges_history (run_id, edge_type, edge_count)
-               VALUES (%s, %s, %s)""",
-            (run_id, edge_type, count),
+            """SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'ingest_runs' AND column_name = 'prev_edge_counts'"""
         )
+        if cur.fetchone():
+            if run_id:
+                cur.execute(
+                    "UPDATE ingest_runs SET prev_edge_counts = %s WHERE id = %s",
+                    (json.dumps(edge_counts), run_id),
+                )
+            else:
+                # No run_id — create a new run for the record
+                cur.execute(
+                    """INSERT INTO ingest_runs
+                       (run_mode, status, repos_processed, prev_edge_counts)
+                       VALUES ('graph_build', 'success', %s, %s)""",
+                    (sum(edge_counts.values()), json.dumps(edge_counts)),
+                )
+        else:
+            logger.info("Edge counts (no ingest_runs support): %s", edge_counts)
+    except Exception as ex:
+        logger.warning("Failed to record edge history: %s", ex)
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — atomic rebuild with crash recovery
 # ---------------------------------------------------------------------------
 
 def main():
-    t0 = time.monotonic()
-    logger.info("Building knowledge graph edges ($0)")
+    """
+    Entry point for atomic graph rebuild.
 
-    conn = psycopg2.connect(get_db_url())
-    cur = conn.cursor()
+    Delegates to ingestion.graph.atomic_swap (staging table swap) and
+    ingestion.graph.ingest_run_manager (crash-safe ingest_runs tracking).
 
-    # Verify migration 031 has run
-    verify_table(cur)
-    logger.info("repo_edges table verified")
+    Set RESUME_CRASHED_RUN=1 to resume a previously crashed run.
+    """
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-    # Clear only managed edge types (preserve others like MAINTAINED_BY)
-    cur.execute(
-        "DELETE FROM repo_edges "
-        "WHERE edge_type IN ('COMPATIBLE_WITH', 'ALTERNATIVE_TO', 'DEPENDS_ON');"
+    from ingestion.graph.atomic_swap import build_and_swap
+    from ingestion.graph.ingest_run_manager import (
+        IngestRunManager, EdgeCountValidationError
     )
-    deleted = cur.rowcount
-    conn.commit()
-    logger.info(f"Cleared {deleted} existing managed edges")
 
-    # Build each edge type
-    compatible_edges = build_compatible_with(cur)
-    alternative_edges = build_alternative_to(cur)
-    depends_edges = build_depends_on(cur)
+    db_url = get_db_url()
+    triggered_by = os.getenv("TRIGGERED_BY", "manual").strip()
+    resume_crashed = os.getenv("RESUME_CRASHED_RUN", "").strip().lower() in ("1", "true", "yes")
 
-    # Insert all
-    c1 = insert_edges(cur, compatible_edges, "COMPATIBLE_WITH")
-    conn.commit()
-    c2 = insert_edges(cur, alternative_edges, "ALTERNATIVE_TO")
-    conn.commit()
-    c3 = insert_edges(cur, depends_edges, "DEPENDS_ON")
-    conn.commit()
+    run_manager = IngestRunManager(db_url)
+    run_id = None
 
-    # Record history for velocity tracking
-    edge_counts = {
-        "COMPATIBLE_WITH": c1,
-        "ALTERNATIVE_TO": c2,
-        "DEPENDS_ON": c3,
-    }
+    if resume_crashed:
+        crashed = run_manager.find_crashed_run()
+        if crashed:
+            logger.info("Resuming crashed run id=%d", crashed)
+            checkpoint = run_manager.load_checkpoint(crashed) or {}
+            logger.info("Prior checkpoint: %s", checkpoint)
+            run_id = crashed
+        else:
+            logger.info("No crashed run found — starting fresh")
+
+    if run_id is None:
+        run_id = run_manager.start(triggered_by=triggered_by)
+
+    logger.info("Graph build starting [run_id=%d triggered_by=%s]", run_id, triggered_by)
+
     try:
-        record_history(cur, edge_counts)
-        conn.commit()
-    except Exception as ex:
-        logger.warning(f"Failed to record edge history: {ex}")
-        conn.rollback()
+        edge_counts = build_and_swap(db_url, run_id, run_manager)
+        run_manager.complete(run_id, edge_counts)
 
-    elapsed = time.monotonic() - t0
-
-    # Summary
-    cur.execute(
-        "SELECT edge_type, COUNT(*) FROM repo_edges GROUP BY edge_type ORDER BY edge_type;"
-    )
-    print()
-    print("=" * 60)
-    print("KNOWLEDGE GRAPH SUMMARY")
-    print("=" * 60)
-    total = 0
-    for row in cur.fetchall():
-        print(f"  {row[0]}: {row[1]} edges")
-        total += row[1]
-    print(f"  TOTAL: {total} edges")
-    print(f"  Time: {elapsed:.1f}s")
-    print(f"  Cost: $0.00")
-    print()
-
-    for label, edges_list in [
-        ("COMPATIBLE_WITH", compatible_edges),
-        ("ALTERNATIVE_TO", alternative_edges),
-        ("DEPENDS_ON", depends_edges),
-    ]:
-        print(f"EXAMPLE {label} EDGES:")
-        for e in edges_list[:3]:
-            confidence_str = f" (confidence={e.get('confidence', '?')})"
-            print(f"  {e['source_name']} <-> {e['target_name']}{confidence_str}")
-            print(f"    evidence: {e['evidence']}")
+        total = sum(edge_counts.values())
+        print()
+        print("=" * 60)
+        print("KNOWLEDGE GRAPH SUMMARY (atomic swap)")
+        print("=" * 60)
+        for etype, count in sorted(edge_counts.items()):
+            print(f"  {etype}: {count} edges")
+        print(f"  TOTAL: {total} edges")
+        print(f"  run_id: {run_id}")
         print()
 
-    conn.close()
+        if edge_counts.get("DEPENDS_ON", 0) == 0:
+            logger.warning(
+                "::warning::DEPENDS_ON edge count is 0 — "
+                "check that repo_dependencies is populated"
+            )
+
+    except EdgeCountValidationError as exc:
+        logger.error("Edge count validation failed — swap aborted: %s", exc)
+        run_manager.fail(run_id, exc)
+        print(f"\n::warning::Graph swap aborted: {exc}")
+        sys.exit(1)
+
+    except Exception as exc:
+        logger.error("Graph build failed: %s", exc, exc_info=True)
+        run_manager.fail(run_id, exc)
+        raise
 
 
 if __name__ == "__main__":
