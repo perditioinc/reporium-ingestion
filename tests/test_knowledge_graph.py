@@ -58,7 +58,7 @@ class TestBuildDependsOn:
         edge = edges[0]
         assert str(edge["source"]) == repo_a or edge["source"] == repo_a
         assert edge["confidence"] == 0.95
-        assert edge["evidence"]["method"] == "repo_dependencies"
+        assert edge["metadata"]["method"] == "repo_dependencies"
 
     def test_empty_table_returns_empty_not_crash(self, db_conn):
         """With zero rows in repo_dependencies, returns [] — no crash."""
@@ -165,7 +165,7 @@ class TestBuildCompatibleWith:
         edge = edges[0]
         # 2 shared tags / 5 = 0.4
         assert edge["confidence"] == pytest.approx(0.4, abs=0.01)
-        assert edge["evidence"]["count"] == 2
+        assert edge["metadata"]["count"] == 2
 
     def test_confidence_caps_at_085(self, db_conn):
         """Confidence should not exceed 0.85 even with many shared tags."""
@@ -290,7 +290,7 @@ class TestInsertEdges:
             "target": b,
             "weight": 0.8,
             "confidence": 0.6,
-            "evidence": {"test": True},
+            "metadata": {"test": True},
         }]
         count = insert_edges(cur, edges, "TEST_EDGE")
         db_conn.commit()
@@ -308,11 +308,11 @@ class TestInsertEdges:
         b = make_repo(cur, name="b", owner="o")
         db_conn.commit()
 
-        edges_v1 = [{"source": a, "target": b, "weight": 0.5, "confidence": 0.3, "evidence": {}}]
+        edges_v1 = [{"source": a, "target": b, "weight": 0.5, "confidence": 0.3, "metadata": {}}]
         insert_edges(cur, edges_v1, "TEST")
         db_conn.commit()
 
-        edges_v2 = [{"source": a, "target": b, "weight": 0.9, "confidence": 0.8, "evidence": {"updated": True}}]
+        edges_v2 = [{"source": a, "target": b, "weight": 0.9, "confidence": 0.8, "metadata": {"updated": True}}]
         insert_edges(cur, edges_v2, "TEST")
         db_conn.commit()
 
@@ -362,7 +362,7 @@ class TestVerifyTable:
         with pytest.raises(RuntimeError, match="repo_edges table does not exist"):
             verify_table(cur)
 
-        # Recreate for other tests
+        # Recreate for other tests — schema must match migration 033
         cur.execute("""
             CREATE TABLE repo_edges (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -371,9 +371,8 @@ class TestVerifyTable:
                 edge_type TEXT NOT NULL,
                 weight FLOAT DEFAULT 1.0,
                 confidence FLOAT DEFAULT 0.5,
-                evidence JSONB DEFAULT '{}',
+                metadata JSONB DEFAULT '{}',
                 created_at TIMESTAMPTZ DEFAULT NOW(),
-                updated_at TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE (source_repo_id, target_repo_id, edge_type)
             )
         """)

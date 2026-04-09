@@ -145,7 +145,7 @@ def build_compatible_with(cur):
             "target": r2["id"],
             "weight": weight,
             "confidence": confidence,
-            "evidence": {"shared_tags": sorted(shared_tags), "count": len(shared_tags)},
+            "metadata": {"shared_tags": sorted(shared_tags), "count": len(shared_tags)},
             "source_name": r1["forked_from"] or r1["name"],
             "target_name": r2["forked_from"] or r2["name"],
         })
@@ -213,7 +213,7 @@ def build_alternative_to(cur):
                     "target": r2["id"],
                     "weight": 0.7,
                     "confidence": 0.4,  # keyword fallback = low confidence
-                    "evidence": {"category": group_name, "method": "problem_solved_keywords"},
+                    "metadata": {"category": group_name, "method": "problem_solved_keywords"},
                     "source_name": r1["forked_from"] or r1["name"],
                     "target_name": r2["forked_from"] or r2["name"],
                 })
@@ -268,7 +268,7 @@ def build_alternative_to(cur):
             "target": r2["id"],
             "weight": 1.0,
             "confidence": 0.7,  # same DB category row
-            "evidence": {"category": cat, "method": "primary_category"},
+            "metadata": {"category": cat, "method": "primary_category"},
             "source_name": r1["forked_from"] or r1["name"],
             "target_name": r2["forked_from"] or r2["name"],
         })
@@ -355,7 +355,7 @@ def build_depends_on(cur):
                     "target": target["id"],
                     "weight": 1.0,
                     "confidence": 0.95,  # deterministic, from actual package files
-                    "evidence": {
+                    "metadata": {
                         "package": pkg_name,
                         "ecosystem": ecosystem,
                         "method": "repo_dependencies",
@@ -384,17 +384,16 @@ def insert_edges(cur, edges, edge_type):
             values.append("(%s, %s, %s, %s, %s, %s)")
             params.extend([
                 str(e["source"]), str(e["target"]), edge_type,
-                e["weight"], e.get("confidence", 0.5), json.dumps(e["evidence"]),
+                e["weight"], e.get("confidence", 0.5), json.dumps(e["metadata"]),
             ])
         sql = (
             "INSERT INTO repo_edges "
-            "(source_repo_id, target_repo_id, edge_type, weight, confidence, evidence) "
+            "(source_repo_id, target_repo_id, edge_type, weight, confidence, metadata) "
             "VALUES " + ", ".join(values)
             + " ON CONFLICT (source_repo_id, target_repo_id, edge_type) DO UPDATE SET"
             " weight = EXCLUDED.weight,"
             " confidence = EXCLUDED.confidence,"
-            " evidence = EXCLUDED.evidence,"
-            " updated_at = NOW()"
+            " metadata = EXCLUDED.metadata"
         )
         try:
             cur.execute(sql, params)

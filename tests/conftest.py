@@ -38,16 +38,23 @@ def db_url():
 
 @pytest.fixture(scope="session")
 def db_setup(db_url):
-    """One-time schema setup: create all tables needed by the graph builder.
+    """One-time schema setup.
 
-    Uses raw SQL matching the Alembic migrations so tests run against the
-    real schema — not an ORM approximation.
+    In CI, Alembic migrations run before pytest (see test.yml), so all tables
+    already exist when this fixture runs and the CREATE TABLE IF NOT EXISTS
+    statements below are no-ops.
+
+    For local dev without migrations these statements create a compatible
+    minimal schema so integration tests can still run.
     """
     conn = psycopg2.connect(db_url)
     conn.autocommit = True
     cur = conn.cursor()
 
-    # repos (minimal columns needed by graph builder)
+    # pgvector extension (needed by alembic migrations; safe to re-run)
+    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
+    # repos (minimal columns needed by graph builder — full schema from migrations)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS repos (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -97,7 +104,7 @@ def db_setup(db_url):
         )
     """)
 
-    # repo_edges (migration 031)
+    # repo_edges (migration 033) — metadata column, no updated_at
     cur.execute("""
         CREATE TABLE IF NOT EXISTS repo_edges (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -106,9 +113,8 @@ def db_setup(db_url):
             edge_type TEXT NOT NULL,
             weight FLOAT DEFAULT 1.0,
             confidence FLOAT DEFAULT 0.5,
-            evidence JSONB DEFAULT '{}',
+            metadata JSONB DEFAULT '{}',
             created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (source_repo_id, target_repo_id, edge_type)
         )
     """)
@@ -116,7 +122,7 @@ def db_setup(db_url):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_target ON repo_edges(target_repo_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_type ON repo_edges(edge_type)")
 
-    # repo_edges_history (migration 032)
+    # repo_edges_history (migration 033) — count-log schema
     cur.execute("""
         CREATE TABLE IF NOT EXISTS repo_edges_history (
             id SERIAL PRIMARY KEY,
