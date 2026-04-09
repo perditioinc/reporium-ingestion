@@ -30,22 +30,10 @@ jobs:
           --health-retries 5
 
     env:
-      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/reporium_test
-      REPORIUM_API_PATH: reporium-api
-      # Required by reporium-api pydantic Settings during alembic migration run
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/reporium_test
-      INGESTION_API_KEY: ci-test-dummy-key
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-
-      # Checkout reporium-api alongside for Alembic migrations
-      - name: Checkout reporium-api (for migrations)
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          repository: perditioinc/reporium-api
-          path: reporium-api
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -54,11 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install psycopg2-binary alembic sqlalchemy
-          # Install reporium-api deps so alembic env.py imports succeed
-          if [ -f reporium-api/requirements.txt ]; then
-            pip install -r reporium-api/requirements.txt || true
-          fi
+          pip install psycopg2-binary pytest
 
       - name: Run tests
         run: pytest tests/test_backfill.py tests/test_enrichment.py tests/test_knowledge_graph.py -v -k "not summarizer and not multiple_tags"
