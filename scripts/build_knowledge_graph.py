@@ -29,6 +29,8 @@ from itertools import combinations
 
 import psycopg2
 
+from ingestion.enrichment.canonicalize import canonicalize_tags
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -79,7 +81,10 @@ def build_compatible_with(cur) -> list[dict]:
 
     repos_with_tags = []
     for row in cur.fetchall():
-        tags = row[3] if isinstance(row[3], list) else json.loads(row[3]) if row[3] else []
+        raw_tags = row[3] if isinstance(row[3], list) else json.loads(row[3]) if row[3] else []
+        # Canonicalize so "llm"/"LLMs"/"large language model" all collapse to the
+        # same canonical form before the intersection is computed.
+        tags = canonicalize_tags(raw_tags)
         if len(tags) >= 1:
             repos_with_tags.append({
                 "id": row[0],
