@@ -97,7 +97,7 @@ def db_setup(db_url):
         )
     """)
 
-    # repo_edges (migration 031)
+    # repo_edges (migration 031 + 034: ingest_run_id column added in Wave 3)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS repo_edges (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -107,6 +107,7 @@ def db_setup(db_url):
             weight FLOAT DEFAULT 1.0,
             confidence FLOAT DEFAULT 0.5,
             metadata JSONB DEFAULT '{}',
+            ingest_run_id INTEGER,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (source_repo_id, target_repo_id, edge_type)
@@ -169,6 +170,15 @@ def db_setup(db_url):
     cur.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_repo_embeddings_current
         ON repo_embeddings(repo_id) WHERE is_current = true
+    """)
+
+    # Migration 034 backfill: ensure ingest_run_id exists on repo_edges even if
+    # the Alembic migration in reporium-api hasn't been promoted yet.  This is
+    # idempotent — ALTER TABLE ... ADD COLUMN IF NOT EXISTS is a no-op when the
+    # column already exists.
+    cur.execute("""
+        ALTER TABLE repo_edges
+        ADD COLUMN IF NOT EXISTS ingest_run_id INTEGER
     """)
 
     cur.close()
