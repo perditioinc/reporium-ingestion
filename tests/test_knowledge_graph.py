@@ -513,7 +513,7 @@ class TestEdgeCountValidation:
         assert ABORT_DROP_FRACTION == 0.50
         assert WARN_DROP_FRACTION == 0.20
 
-    def test_validation_with_db(self, db_conn):
+    def test_validation_with_db(self, db_conn, db_setup):
         """Full validation flow: create prior run, validate new counts."""
         from ingestion.graph.ingest_run_manager import IngestRunManager, EdgeCountValidationError
 
@@ -528,7 +528,7 @@ class TestEdgeCountValidation:
         )
         db_conn.commit()
 
-        manager = IngestRunManager(db_conn.dsn if hasattr(db_conn, 'dsn') else db_conn.info.dsn)
+        manager = IngestRunManager(db_setup)
 
         # New run with acceptable counts — should pass
         cur.execute(
@@ -545,7 +545,7 @@ class TestEdgeCountValidation:
             {"COMPATIBLE_WITH": 480, "ALTERNATIVE_TO": 290, "DEPENDS_ON": 195},
         )
 
-    def test_validation_aborts_on_zero_with_prior(self, db_conn):
+    def test_validation_aborts_on_zero_with_prior(self, db_conn, db_setup):
         """Should abort if a type with >100 edges drops to zero."""
         from ingestion.graph.ingest_run_manager import IngestRunManager, EdgeCountValidationError
 
@@ -560,7 +560,7 @@ class TestEdgeCountValidation:
         )
         db_conn.commit()
 
-        manager = IngestRunManager(db_conn.info.dsn)
+        manager = IngestRunManager(db_setup)
 
         cur.execute(
             """INSERT INTO ingest_runs
