@@ -41,6 +41,7 @@ class ExtractionResult:
     repo_name: str
     dependencies: list[str]
     source_file: Optional[str]
+    ecosystem: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -169,6 +170,16 @@ PARSERS = {
     "Cargo.toml": parse_cargo_toml,
 }
 
+# Map dependency file names to package ecosystem identifiers.
+FILE_TO_ECOSYSTEM = {
+    "requirements.txt": "pypi",
+    "pyproject.toml": "pypi",
+    "setup.py": "pypi",
+    "package.json": "npm",
+    "go.mod": "go",
+    "Cargo.toml": "cargo",
+}
+
 
 async def fetch_file_content(
     client: httpx.AsyncClient,
@@ -231,6 +242,7 @@ async def extract_dependencies_for_repo(
                         repo_name=f"{owner}/{repo_name}",
                         dependencies=deps,
                         source_file=f"{target_owner}/{target_repo}/{filepath}",
+                        ecosystem=FILE_TO_ECOSYSTEM.get(filepath, "unknown"),
                     )
 
     # No dependency file found — return empty (checked, no deps)
@@ -244,25 +256,28 @@ async def extract_dependencies_for_repo(
 
 async def run_dependency_extraction(db_url: str, gh_token: str) -> dict:
     """
-    Main entry point: extract dependencies for all repos with null dependencies.
-    Returns summary dict.
+    Main entry point: extract dependencies for all repos not yet scanned.
+
+    Writes to the ``repo_dependencies`` table (migration 029).  A repo is
+    considered "scanned" once it has at least one row in that table.  Repos
+    with no dependency file get a sentinel row (package_name='__none__') so
+    they are not rescanned on the next run.
     """
     conn = psycopg2.connect(db_url)
     cur = conn.cursor()
 
-    # Get repos that haven't been checked yet.
-    # NULL = not yet checked. After extraction:
-    #   [] = checked, no deps found
-    #   ["pkg1", "pkg2"] = checked, deps found
+    # Find repos that have never been scanned for dependencies.
+    # A repo is "scanned" once it has at least one row in repo_dependencies.
     cur.execute("""
-        SELECT id, name, owner, forked_from
-        FROM repos
-        WHERE dependencies IS NULL
-        ORDER BY name;
+        SELECT r.id, r.name, r.owner, r.forked_from
+        FROM repos r
+        LEFT JOIN repo_dependencies rd ON r.id = rd.repo_id
+        WHERE rd.repo_id IS NULL
+        ORDER BY r.name;
     """)
     repos = cur.fetchall()
     total = len(repos)
-    logger.info("Found %d repos with null dependencies to process", total)
+    logger.info("Found %d repos needing dependency scan", total)
 
     if total == 0:
         conn.close()
@@ -285,18 +300,32 @@ async def run_dependency_extraction(db_url: str, gh_token: str) -> dict:
                     errors += 1
                     logger.warning("Error for %s: %s", result.repo_name, result.error)
                 else:
-                    deps_json = json.dumps(result.dependencies)
-                    cur.execute(
-                        "UPDATE repos SET dependencies = %s::jsonb WHERE id = %s",
-                        (deps_json, repo_id),
-                    )
-                    conn.commit()
-                    processed += 1
-
                     if result.dependencies:
+                        # Insert each dependency into repo_dependencies
+                        for pkg in result.dependencies:
+                            cur.execute(
+                                """INSERT INTO repo_dependencies
+                                       (id, repo_id, package_name, package_ecosystem, is_direct)
+                                   VALUES (gen_random_uuid(), %s, %s, %s, true)
+                                   ON CONFLICT (repo_id, package_name, package_ecosystem)
+                                   DO NOTHING""",
+                                (str(repo_id), pkg, result.ecosystem),
+                            )
                         with_deps += 1
                     else:
+                        # Sentinel row: marks repo as scanned with zero deps
+                        cur.execute(
+                            """INSERT INTO repo_dependencies
+                                   (id, repo_id, package_name, package_ecosystem, is_direct)
+                               VALUES (gen_random_uuid(), %s, '__none__', '__sentinel__', false)
+                               ON CONFLICT (repo_id, package_name, package_ecosystem)
+                               DO NOTHING""",
+                            (str(repo_id),),
+                        )
                         no_deps += 1
+
+                    conn.commit()
+                    processed += 1
 
                 # Progress logging every 50 repos
                 if (i + 1) % 50 == 0:
