@@ -205,7 +205,7 @@ Next: continue Phase 2 from where left off (skip repos with non-null readme_summ
 async def run_ai_enrichment(
     db_url: str,
     api_key: str,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-haiku-4-5",
     base_dir: str = ".",
 ) -> RunStats:
     """
