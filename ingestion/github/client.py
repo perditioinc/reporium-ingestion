@@ -115,11 +115,12 @@ class GitHubClient:
                     self._update_rate_limit(resp)
                     self.rate_limiter.record_call()
 
-                    await self.db.log_api_call(
-                        endpoint=path,
-                        status_code=resp.status_code,
-                        rate_limit_remaining=self._parse_remaining(resp),
-                    )
+                    if self.db is not None:
+                        await self.db.log_api_call(
+                            endpoint=path,
+                            status_code=resp.status_code,
+                            rate_limit_remaining=self._parse_remaining(resp),
+                        )
 
                     if resp.status_code == 200:
                         return resp.json()
