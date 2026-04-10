@@ -113,6 +113,10 @@ def db_setup(db_url):
             UNIQUE (source_repo_id, target_repo_id, edge_type)
         )
     """)
+    # Ensure ingest_run_id exists even when Alembic ran first and the
+    # CREATE TABLE IF NOT EXISTS above was a no-op (migration 033 adds it,
+    # but older CI environments may not have it yet).
+    cur.execute("ALTER TABLE repo_edges ADD COLUMN IF NOT EXISTS ingest_run_id INTEGER")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_source ON repo_edges(source_repo_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_target ON repo_edges(target_repo_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_type ON repo_edges(edge_type)")
