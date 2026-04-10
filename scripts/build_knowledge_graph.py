@@ -237,12 +237,14 @@ def build_alternative_to(cur):
         logger.info(f"  ALTERNATIVE_TO edges (keyword fallback): {len(edges)}")
         return edges
 
-    # Use primary_category to avoid multi-category explosion.
+    # Use repo_categories (is_primary=true) to find primary category per repo.
+    # NOTE: repos.primary_category was never added to the Alembic schema -- always
+    # use the repo_categories table, not a column on repos.
     cur.execute("""
-        SELECT r.primary_category, r.id, r.name, r.forked_from
+        SELECT rc.category_name, r.id, r.name, r.forked_from
         FROM repos r
-        WHERE r.primary_category IS NOT NULL
-        ORDER BY r.primary_category;
+        JOIN repo_categories rc ON rc.repo_id = r.id AND rc.is_primary = true
+        ORDER BY rc.category_name;
     """)
 
     cat_repos = defaultdict(list)
@@ -252,7 +254,7 @@ def build_alternative_to(cur):
         cat_repos[row[0]].append(repo)
         repo_by_id[str(row[1])] = repo
 
-    logger.info(f"  Categories (primary_category): {len(cat_repos)}")
+    logger.info(f"  Categories (repo_categories is_primary): {len(cat_repos)}")
 
     # Top-K-per-repo strategy
     repo_candidates = defaultdict(list)
