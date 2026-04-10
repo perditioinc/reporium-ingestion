@@ -12,6 +12,7 @@ Usage:
 """
 import asyncio
 import logging
+import math
 import sys
 import time
 import json
@@ -39,6 +40,7 @@ from .enrichment.summarizer import RepoSummarizer
 from .api.client import ReporiumAPIClient
 from .analysis.trends import build_trend_snapshot
 from .analysis.gaps import detect_gaps
+from .extractors.dependencies import FILE_TO_ECOSYSTEM
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -73,6 +75,59 @@ def _build_language_percentages(breakdown: dict[str, int]) -> dict[str, float]:
     if not total:
         return {}
     return {lang: round(bytes_ / total * 100, 1) for lang, bytes_ in breakdown.items()}
+
+
+def _compute_activity_score(
+    *,
+    stars: int,
+    forks: int,
+    commits_last7: int,
+    commits_last30: int,
+    commits_last90: int,
+    is_archived: bool,
+) -> dict:
+    """
+    Returns {'activity_score': int, 'activity_score_breakdown': dict}.
+
+    Archived repos are scored differently — they can't accumulate new commit velocity
+    so we cap them at 10, driven only by log-scaled star count as a proxy for
+    historical relevance.
+
+    Active repos:
+      commits   : min(60, last30d * 3 + last7d * 5)  — velocity signal
+      stars     : min(15, log2(stars+1) * 2)          — popularity
+      forks     : min(15, log2(forks+1) * 3)          — ecosystem adoption
+      recency   : 10 if any commit in last 90d else 0  — still alive?
+    Total max = 100.
+    """
+    if is_archived:
+        score = min(10, int(math.log2(stars + 1) * 1.5))
+        return {
+            "activity_score": score,
+            "activity_score_breakdown": {
+                "archived": True,
+                "stars_component": score,
+                "total": score,
+            },
+        }
+
+    commits_component = min(60, commits_last30 * 3 + commits_last7 * 5)
+    stars_component = min(15, int(math.log2(stars + 1) * 2))
+    forks_component = min(15, int(math.log2(forks + 1) * 3))
+    recency_bonus = 10 if commits_last90 > 0 else 0
+    total = min(100, commits_component + stars_component + forks_component + recency_bonus)
+
+    return {
+        "activity_score": total,
+        "activity_score_breakdown": {
+            "archived": False,
+            "commits_component": commits_component,
+            "stars_component": stars_component,
+            "forks_component": forks_component,
+            "recency_bonus": recency_bonus,
+            "total": total,
+        },
+    }
 
 
 async def _to_api_payload(
@@ -161,7 +216,7 @@ async def _to_api_payload(
         'primary_language': repo.primary_language,
         'github_url': repo.github_url,
         'open_issues_count': repo.open_issues_count,
-        'stargazers_count': repo.stars,
+        'forks_count': repo.forks_count,
         'fork_sync_state': fetched.fork_sync_state,
         'behind_by': fetched.behind_by,
         'ahead_by': fetched.ahead_by,
@@ -169,7 +224,14 @@ async def _to_api_payload(
         'commits_last_30_days': commit_stats['last30Days'],
         'commits_last_90_days': commit_stats['last90Days'],
         'readme_summary': summary,
-        'activity_score': min(100, commit_stats['last30Days'] * 5 + commit_stats['last7Days'] * 10),
+        **_compute_activity_score(
+            stars=repo.stars or 0,
+            forks=repo.forks_count or 0,
+            commits_last7=commit_stats['last7Days'],
+            commits_last30=commit_stats['last30Days'],
+            commits_last90=commit_stats['last90Days'],
+            is_archived=repo.is_archived,
+        ),
         'tags': tags,
         'categories': categories_list,
         'builders': [builder],
@@ -188,6 +250,11 @@ async def _to_api_payload(
         'has_ci': fetched.has_ci,
         'integration_tags': [],
         'dependencies': fetched.dependencies,
+        # Derive ecosystem from the source file so the API can tag repo_dependencies rows correctly.
+        'dep_ecosystem': (
+            FILE_TO_ECOSYSTEM.get(fetched.dep_source_file.split('/')[-1])
+            if fetched.dep_source_file else None
+        ),
         'license_spdx': fetched.github_repo.license_spdx,
         'languages': languages_list,
         'commits': commits_list,
