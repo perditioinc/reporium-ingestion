@@ -220,13 +220,12 @@ def make_repo(cur, name="test-repo", owner="testowner", **kwargs):
     }
     defaults.update(kwargs)
     cur.execute(
-        """INSERT INTO repos (id, name, owner, forked_from, primary_category,
+        """INSERT INTO repos (id, name, owner, forked_from,
                               problem_solved, integration_tags, github_url)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s)""",
         (
             repo_id, name, owner,
             defaults["forked_from"],
-            defaults["primary_category"],
             defaults["problem_solved"],
             json.dumps(defaults["integration_tags"]) if defaults["integration_tags"] else None,
             f"https://github.com/{owner}/{name}",
