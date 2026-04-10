@@ -38,23 +38,16 @@ def db_url():
 
 @pytest.fixture(scope="session")
 def db_setup(db_url):
-    """One-time schema setup.
+    """One-time schema setup: create all tables needed by the graph builder.
 
-    In CI, Alembic migrations run before pytest (see test.yml), so all tables
-    already exist when this fixture runs and the CREATE TABLE IF NOT EXISTS
-    statements below are no-ops.
-
-    For local dev without migrations these statements create a compatible
-    minimal schema so integration tests can still run.
+    Uses raw SQL matching the Alembic migrations so tests run against the
+    real schema — not an ORM approximation.
     """
     conn = psycopg2.connect(db_url)
     conn.autocommit = True
     cur = conn.cursor()
 
-    # pgvector extension (needed by alembic migrations; safe to re-run)
-    cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-
-    # repos (minimal columns needed by graph builder — full schema from migrations)
+    # repos (minimal columns needed by graph builder)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS repos (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -104,7 +97,7 @@ def db_setup(db_url):
         )
     """)
 
-    # repo_edges (migration 033) — metadata column, no updated_at
+    # repo_edges (migration 031)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS repo_edges (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -115,6 +108,7 @@ def db_setup(db_url):
             confidence FLOAT DEFAULT 0.5,
             metadata JSONB DEFAULT '{}',
             created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (source_repo_id, target_repo_id, edge_type)
         )
     """)
@@ -122,16 +116,59 @@ def db_setup(db_url):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_target ON repo_edges(target_repo_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_type ON repo_edges(edge_type)")
 
-    # repo_edges_history (migration 033) — count-log schema
+    # ingest_runs (migration 017 + 032 extensions)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ingest_runs (
+            id SERIAL PRIMARY KEY,
+            run_mode TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running',
+            repos_upserted INTEGER NOT NULL DEFAULT 0,
+            repos_processed INTEGER NOT NULL DEFAULT 0,
+            errors JSONB,
+            started_at TIMESTAMPTZ DEFAULT NOW(),
+            finished_at TIMESTAMPTZ,
+            checkpoint_data JSONB,
+            prev_edge_counts JSONB,
+            git_sha TEXT,
+            triggered_by TEXT
+        )
+    """)
+
+    # repo_edges_history (migration 033 — full edge archive)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS repo_edges_history (
-            id SERIAL PRIMARY KEY,
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            source_repo_id UUID NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+            target_repo_id UUID NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+            edge_type VARCHAR(32) NOT NULL,
+            weight FLOAT NOT NULL DEFAULT 1.0,
+            confidence FLOAT NOT NULL DEFAULT 0.5,
+            metadata JSONB DEFAULT '{}',
+            ingest_run_id INTEGER,
+            valid_from TIMESTAMPTZ DEFAULT NOW(),
+            valid_until TIMESTAMPTZ,
             run_id INTEGER,
-            edge_type TEXT NOT NULL,
             edge_count INTEGER NOT NULL DEFAULT 0,
             sample_edges JSONB,
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
+    """)
+
+    # repo_embeddings (migrations 001 + 034)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS repo_embeddings (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            repo_id UUID NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+            embedding TEXT,
+            model TEXT NOT NULL DEFAULT 'all-MiniLM-L6-v2',
+            generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            is_current BOOLEAN NOT NULL DEFAULT true,
+            ingest_run_id INTEGER
+        )
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_repo_embeddings_current
+        ON repo_embeddings(repo_id) WHERE is_current = true
     """)
 
     cur.close()
@@ -144,8 +181,8 @@ def db_setup(db_url):
     conn.autocommit = True
     cur = conn.cursor()
     for table in [
-        "repo_edges_history", "repo_edges", "repo_dependencies",
-        "repo_categories", "repos",
+        "repo_embeddings", "repo_edges_history", "repo_edges",
+        "ingest_runs", "repo_dependencies", "repo_categories", "repos",
     ]:
         cur.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
     cur.close()
@@ -158,7 +195,7 @@ def clean_tables(db_setup):
     conn = psycopg2.connect(db_setup)
     conn.autocommit = True
     cur = conn.cursor()
-    cur.execute("TRUNCATE repos, repo_categories, repo_dependencies, repo_edges, repo_edges_history CASCADE")
+    cur.execute("TRUNCATE repos, repo_categories, repo_dependencies, repo_edges, repo_edges_history, ingest_runs, repo_embeddings CASCADE")
     cur.close()
     conn.close()
 

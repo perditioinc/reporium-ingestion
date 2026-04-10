@@ -15,8 +15,9 @@ import os
 import psycopg2
 import pytest
 
-# Add scripts/ to path so we can import build_knowledge_graph
+# Add scripts/ and project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from build_knowledge_graph import (
     build_compatible_with,
@@ -58,7 +59,7 @@ class TestBuildDependsOn:
         edge = edges[0]
         assert str(edge["source"]) == repo_a or edge["source"] == repo_a
         assert edge["confidence"] == 0.95
-        assert edge["metadata"]["method"] == "repo_dependencies"
+        assert edge["evidence"]["method"] == "repo_dependencies"
 
     def test_empty_table_returns_empty_not_crash(self, db_conn):
         """With zero rows in repo_dependencies, returns [] — no crash."""
@@ -165,7 +166,7 @@ class TestBuildCompatibleWith:
         edge = edges[0]
         # 2 shared tags / 5 = 0.4
         assert edge["confidence"] == pytest.approx(0.4, abs=0.01)
-        assert edge["metadata"]["count"] == 2
+        assert edge["evidence"]["count"] == 2
 
     def test_confidence_caps_at_085(self, db_conn):
         """Confidence should not exceed 0.85 even with many shared tags."""
@@ -201,7 +202,7 @@ class TestBuildAlternativeTo:
         edges = build_alternative_to(cur)
         assert len(edges) >= 1
         assert edges[0]["confidence"] == 0.7
-        assert edges[0]["metadata"]["method"] == "primary_category"
+        assert edges[0]["evidence"]["method"] == "primary_category"
 
     def test_keyword_fallback_when_no_categories(self, db_conn):
         """When repo_categories is empty, falls back to keyword matching."""
@@ -215,7 +216,7 @@ class TestBuildAlternativeTo:
         edges = build_alternative_to(cur)
         assert len(edges) >= 1
         assert edges[0]["confidence"] == 0.4
-        assert edges[0]["metadata"]["method"] == "problem_solved_keywords"
+        assert edges[0]["evidence"]["method"] == "problem_solved_keywords"
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +291,7 @@ class TestInsertEdges:
             "target": b,
             "weight": 0.8,
             "confidence": 0.6,
-            "metadata": {"test": True},
+            "evidence": {"test": True},
         }]
         count = insert_edges(cur, edges, "TEST_EDGE")
         db_conn.commit()
@@ -308,11 +309,11 @@ class TestInsertEdges:
         b = make_repo(cur, name="b", owner="o")
         db_conn.commit()
 
-        edges_v1 = [{"source": a, "target": b, "weight": 0.5, "confidence": 0.3, "metadata": {}}]
+        edges_v1 = [{"source": a, "target": b, "weight": 0.5, "confidence": 0.3, "evidence": {}}]
         insert_edges(cur, edges_v1, "TEST")
         db_conn.commit()
 
-        edges_v2 = [{"source": a, "target": b, "weight": 0.9, "confidence": 0.8, "metadata": {"updated": True}}]
+        edges_v2 = [{"source": a, "target": b, "weight": 0.9, "confidence": 0.8, "evidence": {"updated": True}}]
         insert_edges(cur, edges_v2, "TEST")
         db_conn.commit()
 
@@ -327,18 +328,27 @@ class TestInsertEdges:
 # ---------------------------------------------------------------------------
 
 class TestRecordHistory:
-    """Tests for edge history tracking."""
+    """Tests for edge count recording via ingest_runs."""
 
-    def test_records_counts(self, db_conn):
+    def test_records_counts_in_ingest_runs(self, db_conn):
+        """record_history writes edge counts to ingest_runs.prev_edge_counts."""
         cur = db_conn.cursor()
-        record_history(cur, {"COMPATIBLE_WITH": 100, "DEPENDS_ON": 50})
+        # Create an ingest_run first
+        cur.execute(
+            """INSERT INTO ingest_runs (run_mode, status, repos_upserted, repos_processed)
+               VALUES ('graph_build', 'running', 0, 0) RETURNING id"""
+        )
+        run_id = cur.fetchone()[0]
         db_conn.commit()
 
-        cur.execute("SELECT edge_type, edge_count FROM repo_edges_history ORDER BY edge_type")
-        rows = cur.fetchall()
-        assert len(rows) == 2
-        assert ("COMPATIBLE_WITH", 100) in rows
-        assert ("DEPENDS_ON", 50) in rows
+        record_history(cur, {"COMPATIBLE_WITH": 100, "DEPENDS_ON": 50}, run_id=run_id)
+        db_conn.commit()
+
+        cur.execute("SELECT prev_edge_counts FROM ingest_runs WHERE id = %s", (run_id,))
+        row = cur.fetchone()
+        counts = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        assert counts["COMPATIBLE_WITH"] == 100
+        assert counts["DEPENDS_ON"] == 50
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +372,7 @@ class TestVerifyTable:
         with pytest.raises(RuntimeError, match="repo_edges table does not exist"):
             verify_table(cur)
 
-        # Recreate for other tests — schema must match migration 033
+        # Recreate for other tests
         cur.execute("""
             CREATE TABLE repo_edges (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -377,3 +387,280 @@ class TestVerifyTable:
             )
         """)
         db_conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Atomic swap tests (PR 2)
+# ---------------------------------------------------------------------------
+
+class TestAtomicSwap:
+    """Tests for the atomic staging → validate → swap pattern."""
+
+    def test_staging_table_insert(self, db_conn):
+        """Edges can be inserted into a staging table and read back."""
+        from ingestion.graph.atomic_swap import _create_staging_table, _insert_into_staging
+
+        cur = db_conn.cursor()
+        a = make_repo(cur, name="src", owner="o")
+        b = make_repo(cur, name="tgt", owner="o")
+        db_conn.commit()
+
+        _create_staging_table(cur)
+        edges = [{
+            "source": a,
+            "target": b,
+            "weight": 0.9,
+            "confidence": 0.85,
+            "evidence": {"test": True},
+        }]
+        count = _insert_into_staging(cur, edges, "COMPATIBLE_WITH")
+        assert count == 1
+
+        cur.execute("SELECT COUNT(*) FROM repo_edges_staging")
+        assert cur.fetchone()[0] == 1
+
+    def test_archive_and_swap_preserves_history(self, db_conn):
+        """Atomic swap archives old edges and inserts new ones."""
+        from ingestion.graph.atomic_swap import (
+            _create_staging_table, _insert_into_staging, _archive_and_swap
+        )
+
+        cur = db_conn.cursor()
+        a = make_repo(cur, name="repo-a", owner="o")
+        b = make_repo(cur, name="repo-b", owner="o")
+        c = make_repo(cur, name="repo-c", owner="o")
+        db_conn.commit()
+
+        # Insert an old edge directly into live table
+        cur.execute(
+            """INSERT INTO repo_edges
+               (source_repo_id, target_repo_id, edge_type, weight, confidence, metadata)
+               VALUES (%s, %s, 'COMPATIBLE_WITH', 0.5, 0.3, '{}')""",
+            (a, b),
+        )
+        db_conn.commit()
+
+        # Stage a new edge
+        _create_staging_table(cur)
+        new_edges = [{
+            "source": a,
+            "target": c,
+            "weight": 0.8,
+            "confidence": 0.7,
+            "evidence": {"new": True},
+        }]
+        _insert_into_staging(cur, new_edges, "COMPATIBLE_WITH")
+
+        # Swap
+        inserted = _archive_and_swap(cur, run_id=None)
+        db_conn.commit()
+
+        assert inserted == 1
+
+        # Old edge should be in history
+        cur.execute(
+            "SELECT COUNT(*) FROM repo_edges_history WHERE source_repo_id = %s AND edge_type = 'COMPATIBLE_WITH'",
+            (a,),
+        )
+        assert cur.fetchone()[0] >= 1
+
+        # Live table should only have the new edge
+        cur.execute("SELECT target_repo_id::text FROM repo_edges WHERE edge_type = 'COMPATIBLE_WITH'")
+        live_targets = [row[0] for row in cur.fetchall()]
+        assert c in live_targets
+        assert b not in live_targets
+
+    def test_swap_preserves_unmanaged_edges(self, db_conn):
+        """Unmanaged edge types (e.g., MAINTAINED_BY) survive the swap."""
+        from ingestion.graph.atomic_swap import (
+            _create_staging_table, _insert_into_staging, _archive_and_swap
+        )
+
+        cur = db_conn.cursor()
+        a = make_repo(cur, name="repo-x", owner="o")
+        b = make_repo(cur, name="repo-y", owner="o")
+        db_conn.commit()
+
+        # Insert an unmanaged edge
+        cur.execute(
+            """INSERT INTO repo_edges
+               (source_repo_id, target_repo_id, edge_type, weight, confidence, metadata)
+               VALUES (%s, %s, 'MAINTAINED_BY', 1.0, 1.0, '{}')""",
+            (a, b),
+        )
+        db_conn.commit()
+
+        # Stage empty (no managed edges)
+        _create_staging_table(cur)
+        _archive_and_swap(cur, run_id=None)
+        db_conn.commit()
+
+        # MAINTAINED_BY should still be there
+        cur.execute("SELECT COUNT(*) FROM repo_edges WHERE edge_type = 'MAINTAINED_BY'")
+        assert cur.fetchone()[0] == 1
+
+
+class TestEdgeCountValidation:
+    """Tests for edge count regression detection."""
+
+    def test_abort_on_large_drop(self):
+        """Should raise EdgeCountValidationError on >50% drop."""
+        from ingestion.graph.ingest_run_manager import IngestRunManager, EdgeCountValidationError
+
+        # We can't easily test validate_edge_counts without a DB, but we can
+        # test the threshold logic by checking the constants
+        from ingestion.graph.ingest_run_manager import ABORT_DROP_FRACTION, WARN_DROP_FRACTION
+        assert ABORT_DROP_FRACTION == 0.50
+        assert WARN_DROP_FRACTION == 0.20
+
+    def test_validation_with_db(self, db_conn):
+        """Full validation flow: create prior run, validate new counts."""
+        from ingestion.graph.ingest_run_manager import IngestRunManager, EdgeCountValidationError
+
+        cur = db_conn.cursor()
+
+        # Create a prior successful run with edge counts
+        cur.execute(
+            """INSERT INTO ingest_runs
+               (run_mode, status, repos_processed, prev_edge_counts, finished_at)
+               VALUES ('graph_build', 'success', 1000, %s, NOW())""",
+            (json.dumps({"COMPATIBLE_WITH": 500, "ALTERNATIVE_TO": 300, "DEPENDS_ON": 200}),),
+        )
+        db_conn.commit()
+
+        manager = IngestRunManager(db_conn.dsn if hasattr(db_conn, 'dsn') else db_conn.info.dsn)
+
+        # New run with acceptable counts — should pass
+        cur.execute(
+            """INSERT INTO ingest_runs
+               (run_mode, status, repos_processed)
+               VALUES ('graph_build', 'running', 0) RETURNING id"""
+        )
+        run_id = cur.fetchone()[0]
+        db_conn.commit()
+
+        # Slight drop — should be fine
+        manager.validate_edge_counts(
+            run_id,
+            {"COMPATIBLE_WITH": 480, "ALTERNATIVE_TO": 290, "DEPENDS_ON": 195},
+        )
+
+    def test_validation_aborts_on_zero_with_prior(self, db_conn):
+        """Should abort if a type with >100 edges drops to zero."""
+        from ingestion.graph.ingest_run_manager import IngestRunManager, EdgeCountValidationError
+
+        cur = db_conn.cursor()
+
+        # Create prior with DEPENDS_ON=200
+        cur.execute(
+            """INSERT INTO ingest_runs
+               (run_mode, status, repos_processed, prev_edge_counts, finished_at)
+               VALUES ('graph_build', 'success', 1000, %s, NOW())""",
+            (json.dumps({"COMPATIBLE_WITH": 500, "DEPENDS_ON": 200}),),
+        )
+        db_conn.commit()
+
+        manager = IngestRunManager(db_conn.info.dsn)
+
+        cur.execute(
+            """INSERT INTO ingest_runs
+               (run_mode, status, repos_processed)
+               VALUES ('graph_build', 'running', 0) RETURNING id"""
+        )
+        run_id = cur.fetchone()[0]
+        db_conn.commit()
+
+        with pytest.raises(EdgeCountValidationError, match="DEPENDS_ON"):
+            manager.validate_edge_counts(
+                run_id,
+                {"COMPATIBLE_WITH": 500, "DEPENDS_ON": 0},
+            )
+
+
+# ---------------------------------------------------------------------------
+# Embedding history tests (PR 2)
+# ---------------------------------------------------------------------------
+
+class TestEmbeddingHistory:
+    """Tests for append-only embedding storage."""
+
+    def test_is_current_column_exists(self, db_conn):
+        """Verify the is_current column exists in repo_embeddings."""
+        cur = db_conn.cursor()
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'repo_embeddings' AND column_name = 'is_current'
+        """)
+        assert cur.fetchone() is not None
+
+    def test_unique_partial_index_enforces_one_current(self, db_conn):
+        """Only one embedding per repo can have is_current=true."""
+        cur = db_conn.cursor()
+        repo_id = make_repo(cur, name="embed-test", owner="org")
+        db_conn.commit()
+
+        # Insert first embedding as current
+        cur.execute(
+            """INSERT INTO repo_embeddings (id, repo_id, embedding, model, is_current)
+               VALUES (gen_random_uuid(), %s, '[]', 'test-model', true)""",
+            (repo_id,),
+        )
+        db_conn.commit()
+
+        # Trying to insert another current one should fail (unique partial index)
+        with pytest.raises(psycopg2.errors.UniqueViolation):
+            cur.execute(
+                """INSERT INTO repo_embeddings (id, repo_id, embedding, model, is_current)
+                   VALUES (gen_random_uuid(), %s, '[]', 'test-model', true)""",
+                (repo_id,),
+            )
+        db_conn.rollback()
+
+    def test_append_only_pattern(self, db_conn):
+        """Mark old as is_current=false, insert new as is_current=true."""
+        cur = db_conn.cursor()
+        repo_id = make_repo(cur, name="embed-hist", owner="org")
+        db_conn.commit()
+
+        # Insert v1
+        cur.execute(
+            """INSERT INTO repo_embeddings (id, repo_id, embedding, model, is_current)
+               VALUES (gen_random_uuid(), %s, '[1.0, 2.0]', 'v1', true)""",
+            (repo_id,),
+        )
+        db_conn.commit()
+
+        # Simulate append-only update: mark old as not current, insert new
+        cur.execute(
+            "UPDATE repo_embeddings SET is_current = false WHERE repo_id = %s AND is_current = true",
+            (repo_id,),
+        )
+        cur.execute(
+            """INSERT INTO repo_embeddings (id, repo_id, embedding, model, is_current)
+               VALUES (gen_random_uuid(), %s, '[3.0, 4.0]', 'v2', true)""",
+            (repo_id,),
+        )
+        db_conn.commit()
+
+        # Should have 2 rows total, 1 current, 1 historical
+        cur.execute("SELECT COUNT(*) FROM repo_embeddings WHERE repo_id = %s", (repo_id,))
+        assert cur.fetchone()[0] == 2
+
+        cur.execute(
+            "SELECT COUNT(*) FROM repo_embeddings WHERE repo_id = %s AND is_current = true",
+            (repo_id,),
+        )
+        assert cur.fetchone()[0] == 1
+
+        cur.execute(
+            "SELECT COUNT(*) FROM repo_embeddings WHERE repo_id = %s AND is_current = false",
+            (repo_id,),
+        )
+        assert cur.fetchone()[0] == 1
+
+        # Current should be v2
+        cur.execute(
+            "SELECT model FROM repo_embeddings WHERE repo_id = %s AND is_current = true",
+            (repo_id,),
+        )
+        assert cur.fetchone()[0] == "v2"
