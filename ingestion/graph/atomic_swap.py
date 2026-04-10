@@ -88,17 +88,22 @@ def _archive_and_swap(cur, run_id: int | None):
     Archives current managed edges to history → deletes them → inserts from staging.
     Must be called inside a transaction (conn.autocommit=False).
     """
-    # Archive current live edges to history
+    # Archive current live edges to history.
+    # We do NOT select ingest_run_id from repo_edges because that column may not
+    # exist on databases that are behind on the migration chain.  The archival
+    # run_id (passed in as run_id) is recorded instead — it identifies the run
+    # that is *replacing* these edges, which is the most useful provenance for
+    # post-mortem queries.
     cur.execute("""
         INSERT INTO repo_edges_history
             (source_repo_id, target_repo_id, edge_type, weight, confidence,
              metadata, ingest_run_id, valid_from, valid_until)
         SELECT
             source_repo_id, target_repo_id, edge_type, weight, confidence,
-            metadata, ingest_run_id, created_at, NOW()
+            metadata, %s, created_at, NOW()
         FROM repo_edges
         WHERE edge_type = ANY(%s)
-    """, (list(MANAGED_TYPES),))
+    """, (run_id, list(MANAGED_TYPES),))
     archived = cur.rowcount
     logger.info("Archived %d live edges to history", archived)
 
@@ -110,16 +115,35 @@ def _archive_and_swap(cur, run_id: int | None):
     deleted = cur.rowcount
     logger.info("Deleted %d old managed edges", deleted)
 
-    # Insert from staging to live
+    # Insert from staging to live.
+    # Use a conditional INSERT that includes ingest_run_id only when the column
+    # exists (migration 033 adds it; older schemas may not have it yet).
     cur.execute("""
-        INSERT INTO repo_edges
-            (source_repo_id, target_repo_id, edge_type, weight, confidence,
-             metadata, ingest_run_id)
-        SELECT
-            source_repo_id, target_repo_id, edge_type, weight, confidence,
-            metadata, %s
-        FROM repo_edges_staging
-    """, (run_id,))
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'repo_edges' AND column_name = 'ingest_run_id'
+    """)
+    has_run_id_col = cur.fetchone() is not None
+
+    if has_run_id_col:
+        cur.execute("""
+            INSERT INTO repo_edges
+                (source_repo_id, target_repo_id, edge_type, weight, confidence,
+                 metadata, ingest_run_id)
+            SELECT
+                source_repo_id, target_repo_id, edge_type, weight, confidence,
+                metadata, %s
+            FROM repo_edges_staging
+        """, (run_id,))
+    else:
+        cur.execute("""
+            INSERT INTO repo_edges
+                (source_repo_id, target_repo_id, edge_type, weight, confidence,
+                 metadata)
+            SELECT
+                source_repo_id, target_repo_id, edge_type, weight, confidence,
+                metadata
+            FROM repo_edges_staging
+        """)
     inserted = cur.rowcount
     logger.info("Inserted %d new edges from staging", inserted)
 
