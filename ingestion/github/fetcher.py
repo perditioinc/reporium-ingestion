@@ -82,18 +82,14 @@ class RepoFetcher:
             if daily_needed:
                 await self._fetch_daily(fetched)
 
-            # WEEKLY tier — also fetch languages in QUICK mode if we don't have any cached
-            needs_weekly = await self.db.needs_weekly_fetch(repo.name)
-            if mode in (RunMode.WEEKLY, RunMode.FULL) and needs_weekly:
+            # WEEKLY tier
+            if mode in (RunMode.WEEKLY, RunMode.FULL) and await self.db.needs_weekly_fetch(repo.name):
                 await self._fetch_weekly(fetched)
             elif cache and cache.language_breakdown:
                 try:
                     fetched.languages = json.loads(cache.language_breakdown)
                 except Exception:
                     pass
-            elif mode == RunMode.QUICK and (not cache or not cache.language_breakdown):
-                # Fetch languages even in QUICK mode if we have no cached data
-                await self._fetch_weekly(fetched)
 
             # REALTIME tier (fork sync)
             if mode == RunMode.FULL and repo.is_fork:

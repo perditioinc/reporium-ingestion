@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased] - 2026-04-08
+
+### Changed
+- **activity_score formula**: Expanded from commit-only to multi-signal scoring:
+  - Commit velocity: `commits_30d * 3 + commits_7d * 5` (up to 60 pts)
+  - Popularity signal: `log2(stars + 1) * 2` (up to 20 pts)
+  - Community engagement: `min(10, open_issues_count)` (up to 10 pts)
+  - Recency bonus: 10 pts if any commits in last 90 days
+  - Total capped at 100
+
 ## [Unreleased] - 2026-03-24
 
 ### Added

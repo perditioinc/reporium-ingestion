@@ -2,16 +2,8 @@
 AI Enrichment using Claude API (claude-sonnet-4-20250514).
 One call per repo. Generates 8 open taxonomy dimensions freely — no hardcoded skill lists.
 
-Cost: ~$7-10 total for 1460 repos (~600 input + ~200 output tokens per call).
+Cost: ~$4-5 total for 826 repos (~600 input + ~200 output tokens per call).
 Every call is logged to COST_LOG.md. Progress saved to RESUME.md every 50 repos.
-
-Schema alignment (2026-03-25):
-  Writes to repos:       readme_summary, problem_solved, integration_tags (jsonb),
-                         quality_signals (jsonb — stores quality_assessment + maturity_level)
-  Writes to repo_taxonomy: one row per (repo_id, dimension, raw_value) for each of
-                         skill_area, industry, use_case, modality, ai_trend, deployment_context
-  Does NOT use:          repos.skill_areas / industries / etc. (columns never existed)
-                         repos.dependencies (dropped in migration 014)
 """
 
 import asyncio
@@ -55,15 +47,14 @@ Rules:
 - industries: omit entirely if the repo is general-purpose AI infrastructure
 - Return ONLY valid JSON, no markdown"""
 
-# Taxonomy dimension mapping: Claude output field → repo_taxonomy.dimension value
-_TAXONOMY_DIMENSIONS = {
-    "skill_areas":          "skill_area",
-    "industries":           "industry",
-    "use_cases":            "use_case",
-    "modalities":           "modality",
-    "ai_trends":            "ai_trend",
-    "deployment_context":   "deployment_context",
+VALID_CATEGORIES = {
+    "agents", "llm-serving", "embeddings", "vector-databases", "evaluation",
+    "fine-tuning", "rag", "orchestration", "observability", "data-processing",
+    "ocr", "vision", "audio", "code-generation", "security", "deployment",
+    "tooling", "datasets", "research", "other",
 }
+
+# VALID_AI_DEV_SKILLS and VALID_LIFECYCLE_GROUPS removed — taxonomy is now open/generative.
 
 
 def _clean_list(values: list) -> list[str]:
@@ -86,6 +77,7 @@ class EnrichmentResult:
     repo_name: str
     readme_summary: Optional[str] = None
     problem_solved: Optional[str] = None
+    categories: list[str] = field(default_factory=list)
     integration_tags: list[str] = field(default_factory=list)
     quality_assessment: str = "medium"
     maturity_level: Optional[str] = None
@@ -119,6 +111,12 @@ def _build_repo_context(row: dict) -> str:
         f"Description: {row.get('description') or 'None'}",
         f"Primary Language: {row.get('primary_language') or 'Unknown'}",
     ]
+    if row.get('dependencies'):
+        deps = row['dependencies']
+        if isinstance(deps, str):
+            deps = json.loads(deps)
+        if deps:
+            parts.append(f"Dependencies: {', '.join(deps[:20])}")
     if row.get('forked_from'):
         parts.append(f"Forked from: {row['forked_from']}")
     return "\n".join(parts)
@@ -151,11 +149,15 @@ def _parse_enrichment_response(text: str) -> dict:
         ml = None
     data["maturity_level"] = ml
 
-    # Open taxonomy list fields
-    for field_name in ("skill_areas", "industries", "use_cases", "modalities", "ai_trends", "deployment_context"):
-        data[field_name] = _clean_list(data.get(field_name, []))
+    # Open list fields — no validation against any fixed set
+    data["skill_areas"] = _clean_list(data.get("skill_areas", []))
+    data["industries"] = _clean_list(data.get("industries", []))
+    data["use_cases"] = _clean_list(data.get("use_cases", []))
+    data["modalities"] = _clean_list(data.get("modalities", []))
+    data["ai_trends"] = _clean_list(data.get("ai_trends", []))
+    data["deployment_context"] = _clean_list(data.get("deployment_context", []))
 
-    # integration_tags — lowercase, deduplicated
+    # integration_tags — lowercase, deduplicated, no max limit
     raw_tags = data.get("integration_tags", [])
     data["integration_tags"] = _clean_list(
         [t.lower() if isinstance(t, str) else t for t in raw_tags]
@@ -197,6 +199,7 @@ Phase 0: COMPLETE
 Phase 1: COMPLETE
 Phase 2: IN PROGRESS — {stats.enriched}/{stats.total} enriched, {stats.errors} errors, ${total_cost:.4f} spent
 Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+Repos in DB: 826
 Next: continue Phase 2 from where left off (skip repos with non-null readme_summary)
 """
     path.write_text(content, encoding="utf-8")
@@ -205,13 +208,11 @@ Next: continue Phase 2 from where left off (skip repos with non-null readme_summ
 async def run_ai_enrichment(
     db_url: str,
     api_key: str,
-    model: str = "claude-haiku-4-5",
+    model: str = "claude-sonnet-4-20250514",
     base_dir: str = ".",
 ) -> RunStats:
     """
     Main entry point: enrich all repos that have null readme_summary.
-    Writes to repos (readme_summary, problem_solved, integration_tags, quality_signals)
-    and inserts taxonomy dimensions directly into repo_taxonomy junction table.
     Writes COST_LOG.md and RESUME.md every 50 repos.
     """
     base = Path(base_dir)
@@ -225,16 +226,11 @@ async def run_ai_enrichment(
     conn = psycopg2.connect(db_url)
     cur = conn.cursor()
 
-    # Get repos needing enrichment.
-    # Use quality_signals IS NULL as the resume signal — readme_summary is populated
-    # by the lightweight summarizer during normal ingestion (1451/1460 repos already
-    # had summaries after recovery), so using it would skip nearly everything.
-    # quality_signals is only written by this enricher, so it's the correct sentinel.
-    # Only select columns that actually exist in the production schema.
+    # Get repos needing enrichment (readme_summary IS NULL)
     cur.execute("""
-        SELECT id, name, owner, description, primary_language, forked_from
+        SELECT id, name, owner, description, primary_language, forked_from, dependencies
         FROM repos
-        WHERE quality_signals IS NULL
+        WHERE readme_summary IS NULL
         ORDER BY name;
     """)
     columns = [d[0] for d in cur.description]
@@ -252,7 +248,6 @@ async def run_ai_enrichment(
 
     for i, repo in enumerate(repos):
         repo_name = f"{repo['owner']}/{repo['name']}"
-        repo_id = str(repo["id"])
 
         try:
             context = _build_repo_context(repo)
@@ -270,44 +265,36 @@ async def run_ai_enrichment(
             text = response.content[0].text
             data = _parse_enrichment_response(text)
 
-            # ── 1. Update columns that actually exist on repos ────────────────
-            # Pack quality_assessment + maturity_level into quality_signals JSONB
-            quality_signals = {
-                "quality": data.get("quality_assessment", "medium"),
-                "maturity": data.get("maturity_level"),
-            }
+            # Write core fields to database
             cur.execute(
                 """UPDATE repos SET
-                    readme_summary    = %s,
-                    problem_solved    = %s,
-                    integration_tags  = %s::jsonb,
-                    quality_signals   = %s::jsonb
+                    readme_summary = %s,
+                    problem_solved = %s,
+                    integration_tags = %s::jsonb,
+                    quality_assessment = %s,
+                    maturity_level = %s,
+                    skill_areas = %s::jsonb,
+                    industries = %s::jsonb,
+                    use_cases = %s::jsonb,
+                    modalities = %s::jsonb,
+                    ai_trends = %s::jsonb,
+                    deployment_context = %s::jsonb
                 WHERE id = %s""",
                 (
                     data.get("readme_summary"),
                     data.get("problem_solved"),
                     json.dumps(data.get("integration_tags", [])),
-                    json.dumps(quality_signals),
+                    data.get("quality_assessment"),
+                    data.get("maturity_level"),
+                    json.dumps(data.get("skill_areas", [])),
+                    json.dumps(data.get("industries", [])),
+                    json.dumps(data.get("use_cases", [])),
+                    json.dumps(data.get("modalities", [])),
+                    json.dumps(data.get("ai_trends", [])),
+                    json.dumps(data.get("deployment_context", [])),
                     repo["id"],
                 ),
             )
-
-            # ── 2. Write taxonomy dimensions to repo_taxonomy junction table ──
-            # Delete existing enrichment rows for this repo first (safe re-run)
-            cur.execute(
-                "DELETE FROM repo_taxonomy WHERE repo_id = %s AND assigned_by = 'enrichment'",
-                (repo_id,),
-            )
-            for field_name, dimension in _TAXONOMY_DIMENSIONS.items():
-                for raw_value in data.get(field_name, []):
-                    if not raw_value or not isinstance(raw_value, str):
-                        continue
-                    cur.execute(
-                        """INSERT INTO repo_taxonomy (repo_id, dimension, raw_value, assigned_by)
-                           VALUES (%s, %s, %s, 'enrichment')
-                           ON CONFLICT (repo_id, dimension, raw_value) DO NOTHING""",
-                        (repo_id, dimension, raw_value.strip()),
-                    )
 
             conn.commit()
             stats.enriched += 1
@@ -323,6 +310,7 @@ async def run_ai_enrichment(
             stats.error_repos.append(repo_name)
             logger.warning("Claude API error for %s: %s", repo_name, e)
             conn.rollback()
+            # Brief pause on API errors
             await asyncio.sleep(2)
 
         except Exception as e:
@@ -341,7 +329,7 @@ async def run_ai_enrichment(
             _write_cost_log(cost_log_path, stats)
             _write_resume(resume_path, stats)
 
-        # Small delay to be respectful of rate limits
+        # Small delay between calls to be respectful of rate limits
         await asyncio.sleep(0.3)
 
     conn.close()
@@ -358,13 +346,15 @@ async def run_ai_enrichment(
         total_cost, elapsed,
     )
 
+    # Write final resume
     resume_path.write_text(
         f"""# Reporium Ingestion Resume
 Phase 0: COMPLETE
 Phase 1: COMPLETE
 Phase 2: COMPLETE — {stats.enriched}/{stats.total} enriched, {stats.errors} errors, ${total_cost:.4f} spent
 Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
-Next phase: 3 (embeddings + taxonomy rebuild)
+Repos in DB: 826
+Next phase: 3 (embeddings)
 """,
         encoding="utf-8",
     )
