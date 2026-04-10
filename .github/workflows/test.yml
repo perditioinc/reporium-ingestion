@@ -66,11 +66,13 @@ jobs:
           path: _reporium_api
 
       - name: Install reporium-api dependencies and run migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test
+          INGESTION_API_KEY: test-api-key
         run: |
           pip install -r _reporium_api/requirements.txt
           cd _reporium_api
-          DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test \
-            alembic upgrade head
+          alembic upgrade head
 
       - name: Run integration tests
         run: pytest tests/test_knowledge_graph.py -v
