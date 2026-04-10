@@ -172,6 +172,15 @@ def db_setup(db_url):
         ON repo_embeddings(repo_id) WHERE is_current = true
     """)
 
+    # Migration 034 backfill: ensure ingest_run_id exists on repo_edges even if
+    # the Alembic migration in reporium-api hasn't been promoted yet.  This is
+    # idempotent — ALTER TABLE ... ADD COLUMN IF NOT EXISTS is a no-op when the
+    # column already exists.
+    cur.execute("""
+        ALTER TABLE repo_edges
+        ADD COLUMN IF NOT EXISTS ingest_run_id INTEGER
+    """)
+
     cur.close()
     conn.close()
 
