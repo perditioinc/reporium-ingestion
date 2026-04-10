@@ -201,7 +201,7 @@ class TestBuildAlternativeTo:
         edges = build_alternative_to(cur)
         assert len(edges) >= 1
         assert edges[0]["confidence"] == 0.7
-        assert edges[0]["evidence"]["method"] == "primary_category"
+        assert edges[0]["metadata"]["method"] == "primary_category"
 
     def test_keyword_fallback_when_no_categories(self, db_conn):
         """When repo_categories is empty, falls back to keyword matching."""
@@ -215,7 +215,7 @@ class TestBuildAlternativeTo:
         edges = build_alternative_to(cur)
         assert len(edges) >= 1
         assert edges[0]["confidence"] == 0.4
-        assert edges[0]["evidence"]["method"] == "problem_solved_keywords"
+        assert edges[0]["metadata"]["method"] == "problem_solved_keywords"
 
 
 # ---------------------------------------------------------------------------

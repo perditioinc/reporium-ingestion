@@ -221,12 +221,12 @@ def build_alternative_to(cur):
         logger.info(f"  ALTERNATIVE_TO edges (keyword fallback): {len(edges)}")
         return edges
 
-    # Use primary_category to avoid multi-category explosion.
+    # Use primary category from repo_categories to avoid multi-category explosion.
     cur.execute("""
-        SELECT r.primary_category, r.id, r.name, r.forked_from
+        SELECT rc.category_name, r.id, r.name, r.forked_from
         FROM repos r
-        WHERE r.primary_category IS NOT NULL
-        ORDER BY r.primary_category;
+        JOIN repo_categories rc ON rc.repo_id = r.id AND rc.is_primary = true
+        ORDER BY rc.category_name;
     """)
 
     cat_repos = defaultdict(list)
@@ -493,7 +493,7 @@ def main():
         for e in edges_list[:3]:
             confidence_str = f" (confidence={e.get('confidence', '?')})"
             print(f"  {e['source_name']} <-> {e['target_name']}{confidence_str}")
-            print(f"    evidence: {e['evidence']}")
+            print(f"    metadata: {e['metadata']}")
         print()
 
     conn.close()
