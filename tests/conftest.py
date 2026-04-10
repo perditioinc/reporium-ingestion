@@ -97,7 +97,7 @@ def db_setup(db_url):
         )
     """)
 
-    # repo_edges (migration 031)
+    # repo_edges (migration 031 + 034: ingest_run_id column added in Wave 3)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS repo_edges (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -107,6 +107,7 @@ def db_setup(db_url):
             weight FLOAT DEFAULT 1.0,
             confidence FLOAT DEFAULT 0.5,
             metadata JSONB DEFAULT '{}',
+            ingest_run_id INTEGER,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (source_repo_id, target_repo_id, edge_type)
