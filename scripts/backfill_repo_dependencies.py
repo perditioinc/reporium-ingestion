@@ -29,6 +29,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 
 import psycopg2
 
@@ -163,12 +164,12 @@ async def run_backfill(
                             cur.execute(
                                 """
                                 INSERT INTO repo_dependencies
-                                    (repo_id, package_name, package_ecosystem, is_direct)
-                                VALUES (%s, %s, %s, true)
+                                    (id, repo_id, package_name, package_ecosystem, is_direct)
+                                VALUES (%s, %s, %s, %s, true)
                                 ON CONFLICT (repo_id, package_name, package_ecosystem)
                                     DO NOTHING
                                 """,
-                                (repo_id, pkg, ecosystem),
+                                (str(uuid.uuid4()), repo_id, pkg, ecosystem),
                             )
                         conn.commit()
                         with_deps += 1
@@ -186,6 +187,7 @@ async def run_backfill(
 
                 except Exception as exc:
                     errors += 1
+                    conn.rollback()
                     logger.warning("[%d/%d] %s/%s — error: %s", i + 1, total, owner, name, exc)
 
                 # Progress checkpoint every 100 repos
