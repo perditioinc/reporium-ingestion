@@ -1,11 +1,15 @@
 import json
 
+import pytest
+
 from ingestion.graph_snapshot import (
     GRAPH_SNAPSHOT_VERSION,
     GraphSnapshotConfig,
     build_graph_snapshot,
     publish_graph_snapshot,
 )
+
+pytestmark = pytest.mark.no_db
 
 
 class FakeCursor:

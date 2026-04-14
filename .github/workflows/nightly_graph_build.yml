@@ -31,14 +31,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
       - name: Install dependencies
-        run: pip install psycopg2-binary
+        run: pip install -r requirements.txt
 
       - name: Build knowledge graph edges
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           INGEST_RUN_ID: ${{ github.event.inputs.ingest_run_id || '' }}
           RESUME_CRASHED_RUN: ${{ github.event.inputs.resume_crashed_run || '1' }}
+          GRAPH_SNAPSHOT_BUCKET: perditio-platform-bucket
+          GRAPH_SNAPSHOT_OBJECT: reporium/graph/knowledge-graph.json
         run: python scripts/build_knowledge_graph.py
 
       - name: Report edge counts
