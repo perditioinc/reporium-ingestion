@@ -21,6 +21,8 @@ from itertools import combinations
 
 import psycopg2
 
+from ingestion.graph_snapshot import build_graph_snapshot, publish_graph_snapshot, resolve_graph_snapshot_config
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -412,6 +414,18 @@ def main():
     for e in depends_edges[:3]:
         print(f"  {e['source_name']} -> {e['target_name']}")
         print(f"    evidence: {e['evidence']}")
+
+    snapshot_config = resolve_graph_snapshot_config()
+    if snapshot_config.enabled:
+        snapshot = build_graph_snapshot(cur)
+        snapshot_result = publish_graph_snapshot(snapshot, snapshot_config)
+        logger.info(
+            "Published knowledge graph snapshot (%s bytes) to %s",
+            snapshot_result["size_bytes"],
+            ", ".join(snapshot_result["destinations"]),
+        )
+    else:
+        logger.info("Skipping knowledge graph snapshot publish; no destination configured")
 
     conn.close()
 

@@ -55,7 +55,7 @@ gcloud run jobs deploy reporium-ingestion \
   --image us-central1-docker.pkg.dev/perditio-platform/reporium/reporium-ingestion:latest \
   --region us-central1 \
   --service-account reporium-ingestion@perditio-platform.iam.gserviceaccount.com \
-  --set-env-vars REPORIUM_API_URL=https://reporium-api-573778300586.us-central1.run.app,GH_USERNAME=perditioinc,ENRICHMENT_MODEL=claude-sonnet-4-20250514,EMBEDDING_MODEL=all-MiniLM-L6-v2,MIN_RATE_LIMIT_BUFFER=100,MAX_CONCURRENCY=2,DEFAULT_RUN_MODE=quick,PUBSUB_REPO_INGESTED_TOPIC=projects/perditio-platform/topics/repo-ingested \
+  --set-env-vars REPORIUM_API_URL=https://reporium-api-573778300586.us-central1.run.app,GH_USERNAME=perditioinc,ENRICHMENT_MODEL=claude-sonnet-4-20250514,EMBEDDING_MODEL=all-MiniLM-L6-v2,MIN_RATE_LIMIT_BUFFER=100,MAX_CONCURRENCY=2,DEFAULT_RUN_MODE=quick,PUBSUB_REPO_INGESTED_TOPIC=projects/perditio-platform/topics/repo-ingested,GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket,GRAPH_SNAPSHOT_OBJECT=reporium/graph/knowledge-graph.json \
   --set-secrets GH_TOKEN=GH_TOKEN:latest,REPORIUM_API_KEY=REPORIUM_API_KEY:latest,INGEST_API_KEY=INGEST_API_KEY:latest,ANTHROPIC_API_KEY=ANTHROPIC_API_KEY:latest
 ```
 
@@ -138,6 +138,7 @@ Operational checks after deployment:
 - confirm `POST /admin/runs` receives completed run records
 - confirm the `repo-ingested` Pub/Sub event is published when configured
 - confirm the downstream API refresh path updates taxonomy and portfolio intelligence
+- confirm `gs://perditio-platform-bucket/reporium/graph/knowledge-graph.json` is updated after graph publication
 
 ## 7. Nightly Scheduling
 
