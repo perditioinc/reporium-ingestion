@@ -41,6 +41,8 @@ from itertools import combinations
 
 import psycopg2
 
+from ingestion.graph_snapshot import build_graph_snapshot, publish_graph_snapshot, resolve_graph_snapshot_config
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -518,6 +520,24 @@ def main():
                 "::warning::DEPENDS_ON edge count is 0 — "
                 "check that repo_dependencies is populated"
             )
+
+        snapshot_config = resolve_graph_snapshot_config()
+        if snapshot_config.enabled:
+            conn = psycopg2.connect(db_url)
+            try:
+                cur = conn.cursor()
+                snapshot = build_graph_snapshot(cur)
+                snapshot_result = publish_graph_snapshot(snapshot, snapshot_config)
+            finally:
+                conn.close()
+
+            logger.info(
+                "Published knowledge graph snapshot (%s bytes) to %s",
+                snapshot_result["size_bytes"],
+                ", ".join(snapshot_result["destinations"]),
+            )
+        else:
+            logger.info("Skipping knowledge graph snapshot publish; no destination configured")
 
     except EdgeCountValidationError as exc:
         logger.error("Edge count validation failed — swap aborted: %s", exc)

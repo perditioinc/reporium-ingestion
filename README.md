@@ -65,6 +65,10 @@ ENRICHMENT_MODEL=claude-sonnet-4-20250514
 
 # Events (optional — GCP Pub/Sub)
 PUBSUB_REPO_INGESTED_TOPIC=projects/perditio-platform/topics/repo-ingested
+
+# Knowledge graph snapshot publication
+GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket
+GRAPH_SNAPSHOT_OBJECT=reporium/graph/knowledge-graph.json
 ```
 
 > **GCP Secret Manager:** In production, `ANTHROPIC_API_KEY`, `REPORIUM_API_KEY`, `INGEST_API_KEY`, and `DATABASE_URL` are resolved automatically from Secret Manager — no `.env` needed on Cloud infra.
@@ -166,6 +170,23 @@ After each successful run, publishes a `repo.ingested` event to GCP Pub/Sub:
 The API's push subscription (`POST /ingest/events/repo-ingested`) receives this and automatically triggers taxonomy embedding, similarity assignment, and portfolio intelligence cache refresh.
 
 Set `PUBSUB_REPO_INGESTED_TOPIC` to enable. Falls back silently if unset or `google-cloud-pubsub` is not installed.
+
+---
+
+## Knowledge Graph Snapshot Publication
+
+The production graph should be served from a durable snapshot artifact rather than request-time database queries.
+
+Snapshot publication paths:
+
+- `python scripts/build_knowledge_graph.py` rebuilds `repo_edges` and republishes the graph snapshot
+- `python scripts/publish_graph_snapshot.py` republishes the current graph snapshot without rebuilding `repo_edges`
+
+Environment variables:
+
+- `GRAPH_SNAPSHOT_BUCKET` â€” GCS bucket for the published artifact
+- `GRAPH_SNAPSHOT_OBJECT` â€” object path, default `reporium/graph/knowledge-graph.json`
+- `GRAPH_SNAPSHOT_LOCAL_PATH` â€” optional local file target for development or tests
 
 ---
 
