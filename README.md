@@ -1,10 +1,10 @@
 # reporium-ingestion
 
-AI-native ingestion pipeline for Reporium. Runs on a Mac Mini, never exposed to the public internet.
+AI-native ingestion pipeline for Reporium. Runs on a Mac Mini, never exposed to the public internet. Currently tracking **~1,544 repos** (as of March 2026).
 
 Fetches GitHub repositories, enriches them with **Claude** (8-dimension open taxonomy), generates embeddings locally with sentence-transformers, and writes to reporium-api. Publishes GCP Pub/Sub events after each run so the API auto-refreshes taxonomy and portfolio intelligence.
 
-> API-call counts below are directional estimates based on the March 2026 milestone corpus. Figures scale with live repo count and cache state.
+> API-call counts below are directional estimates based on the current ~1,544-repo corpus. Figures scale with live repo count and cache state. The March 2026 initial milestone had 826 repos — those historical figures appear in COST_REPORT.md and ARCHITECTURE_DECISIONS.md.
 
 ---
 
@@ -115,9 +115,9 @@ python -m ingestion schedule
 
 | Mode | GitHub API Calls | When | What |
 |------|-----------------|------|------|
-| `quick` | ~127 | Daily | Only repos changed since last run |
-| `weekly` | ~800 | Sunday | Refresh parent stats, languages, fork sync |
-| `full` | ~5,000 | Monthly | Everything — re-generates all embeddings |
+| `quick` | ~240 | Daily | Only repos changed since last run |
+| `weekly` | ~1,500 | Sunday | Refresh parent stats, languages, fork sync |
+| `full` | ~9,300 | Monthly | Everything — re-generates all embeddings |
 | `fix` | ~3/repo | On-demand | Specific repos only |
 
 ---

@@ -11,7 +11,8 @@ permissions:
   issues: write
 
 jobs:
-  test:
+  # Unit tests (no DB required)
+  unit-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -22,5 +23,57 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pytest
-      - name: Run tests
+      - name: Run unit tests
         run: pytest tests/test_backfill.py tests/test_enrichment.py tests/test_graph_snapshot.py -v -k "not summarizer and not multiple_tags"
+
+  # Integration tests (real PostgreSQL + pgvector)
+  integration-tests:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: reporium_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/reporium_test
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest psycopg2-binary
+
+      - name: Checkout reporium-api for migrations
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: perditioinc/reporium-api
+          path: _reporium_api
+
+      - name: Install reporium-api dependencies and run migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test
+          INGESTION_API_KEY: test-api-key
+        run: |
+          pip install -r _reporium_api/requirements.txt
+          cd _reporium_api
+          alembic upgrade head
+
+      - name: Run integration tests
+        run: pytest tests/test_knowledge_graph.py -v
+        timeout-minutes: 5

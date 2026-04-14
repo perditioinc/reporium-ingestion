@@ -20,6 +20,7 @@ class GitHubRepo(BaseModel):
     primary_language: str | None = None
     github_url: str
     stars: int = 0
+    forks_count: int = 0
     open_issues_count: int = 0
     is_archived: bool = False
     topics: list[str] = []
@@ -114,11 +115,12 @@ class GitHubClient:
                     self._update_rate_limit(resp)
                     self.rate_limiter.record_call()
 
-                    await self.db.log_api_call(
-                        endpoint=path,
-                        status_code=resp.status_code,
-                        rate_limit_remaining=self._parse_remaining(resp),
-                    )
+                    if self.db is not None:
+                        await self.db.log_api_call(
+                            endpoint=path,
+                            status_code=resp.status_code,
+                            rate_limit_remaining=self._parse_remaining(resp),
+                        )
 
                     if resp.status_code == 200:
                         return resp.json()
@@ -187,6 +189,7 @@ class GitHubClient:
                     primary_language=r.get('language'),
                     github_url=r['html_url'],
                     stars=r.get('stargazers_count', 0),
+                    forks_count=r.get('forks_count', 0),
                     open_issues_count=r.get('open_issues_count', 0),
                     is_archived=r.get('archived', False),
                     topics=r.get('topics', []),

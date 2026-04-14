@@ -1,0 +1,71 @@
+name: Nightly Graph Build
+
+on:
+  # 8:30 UTC daily — 90 min after nightly enrichment starts at 07:00 UTC
+  schedule:
+    - cron: "30 8 * * *"
+  # Also allow manual trigger for on-demand rebuilds
+  workflow_dispatch:
+    inputs:
+      ingest_run_id:
+        description: "ingest_runs.id to tag edges with (optional)"
+        required: false
+        default: ""
+      resume_crashed_run:
+        description: "Resume a crashed run (1 = yes)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  build-graph:
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build knowledge graph edges
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          INGEST_RUN_ID: ${{ github.event.inputs.ingest_run_id || '' }}
+          RESUME_CRASHED_RUN: ${{ github.event.inputs.resume_crashed_run || '1' }}
+          GRAPH_SNAPSHOT_BUCKET: perditio-platform-bucket
+          GRAPH_SNAPSHOT_OBJECT: reporium/graph/knowledge-graph.json
+        run: python scripts/build_knowledge_graph.py
+
+      - name: Report edge counts
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'EOF'
+          import os, psycopg2
+          conn = psycopg2.connect(os.environ["DATABASE_URL"])
+          cur = conn.cursor()
+          cur.execute("SELECT edge_type, COUNT(*) FROM repo_edges GROUP BY edge_type ORDER BY edge_type;")
+          rows = cur.fetchall()
+          total = sum(r[1] for r in rows)
+          print(f"repo_edges summary (total={total}):")
+          for edge_type, count in rows:
+              print(f"  {edge_type}: {count}")
+          # Alert if DEPENDS_ON is 0 — likely indicates repo_dependencies is empty
+          depends_count = next((r[1] for r in rows if r[0] == "DEPENDS_ON"), 0)
+          if depends_count == 0:
+              print("::warning::DEPENDS_ON edge count is 0 — repo_dependencies may be empty. Run dependency extraction.")
+          conn.close()
+          EOF
