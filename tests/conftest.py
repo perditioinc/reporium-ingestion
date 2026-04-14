@@ -27,6 +27,10 @@ def _db_url() -> str | None:
         return None
 
 
+def _test_requires_db(request: pytest.FixtureRequest) -> bool:
+    return "no_db" not in request.keywords
+
+
 @pytest.fixture(scope="session")
 def db_url():
     """Session-scoped DB URL.  Skips entire test if unavailable."""
@@ -200,14 +204,20 @@ def db_setup(db_url):
 
 
 @pytest.fixture(autouse=True)
-def clean_tables(db_setup):
+def clean_tables(request: pytest.FixtureRequest):
     """Truncate all data between tests for isolation."""
+    if not _test_requires_db(request):
+        yield
+        return
+
+    db_setup = request.getfixturevalue("db_setup")
     conn = psycopg2.connect(db_setup)
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute("TRUNCATE repos, repo_categories, repo_dependencies, repo_edges, repo_edges_history, ingest_runs, repo_embeddings CASCADE")
     cur.close()
     conn.close()
+    yield
 
 
 @pytest.fixture
