@@ -49,6 +49,52 @@ def _log_scale_stars(stars: int | None) -> float:
     return round(math.log10(stars + 1), 4)
 
 
+def validate_graph_snapshot(snapshot: dict[str, Any]) -> None:
+    """
+    Validate that a graph snapshot has expected structure and data integrity.
+    Raises ValueError if validation fails to prevent publishing broken snapshots.
+    """
+    typed_edges = snapshot.get("typed_edges", [])
+    if not typed_edges:
+        raise ValueError("Snapshot has zero typed edges - check repo_edges table in database")
+
+    # Verify all 4 edge types are present
+    edge_types = set(e.get("edge_type") for e in typed_edges)
+    required_types = {"ALTERNATIVE_TO", "COMPATIBLE_WITH", "DEPENDS_ON", "EXTENDS"}
+    missing_types = required_types - edge_types
+    if missing_types:
+        raise ValueError(f"Snapshot missing required edge types: {missing_types}")
+
+    # Count edges by type for diagnostics
+    type_counts = {}
+    for e in typed_edges:
+        etype = e.get("edge_type")
+        type_counts[etype] = type_counts.get(etype, 0) + 1
+
+    # Sanity check: DEPENDS_ON should have reasonable count
+    depends_on_count = type_counts.get("DEPENDS_ON", 0)
+    if depends_on_count < 50:
+        raise ValueError(
+            f"Suspiciously low DEPENDS_ON edge count: {depends_on_count} "
+            f"(expected >50; check dependency extraction is running)"
+        )
+
+    # Sanity check: no single type should dominate >80% (indicates edge balancing broken)
+    total_typed = len(typed_edges)
+    alt_to_count = type_counts.get("ALTERNATIVE_TO", 0)
+    alt_to_percent = (alt_to_count / total_typed * 100) if total_typed > 0 else 0
+    if alt_to_percent > 80:
+        raise ValueError(
+            f"ALTERNATIVE_TO edges dominate {alt_to_percent:.1f}% of typed edges "
+            f"({alt_to_count}/{total_typed}); edge type balancing may be broken"
+        )
+
+    logger.info(
+        "Snapshot validation passed: %s",
+        {k: v for k, v in sorted(type_counts.items())}
+    )
+
+
 def build_graph_snapshot(
     cur,
     *,
@@ -185,7 +231,7 @@ def build_graph_snapshot(
         for source_repo_id, target_repo_id, edge_type, weight in cur.fetchall()
     ]
 
-    return {
+    snapshot = {
         "snapshot_version": GRAPH_SNAPSHOT_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "parameters": {
@@ -202,6 +248,11 @@ def build_graph_snapshot(
         "similarity_edges": similarity_edges,
         "typed_edges": typed_edges,
     }
+
+    # Validate before returning to prevent silent failures
+    validate_graph_snapshot(snapshot)
+
+    return snapshot
 
 
 def publish_graph_snapshot(

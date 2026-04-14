@@ -13,7 +13,12 @@ import os
 
 import psycopg2
 
-from ingestion.graph_snapshot import build_graph_snapshot, publish_graph_snapshot, resolve_graph_snapshot_config
+from ingestion.graph_snapshot import (
+    build_graph_snapshot,
+    publish_graph_snapshot,
+    resolve_graph_snapshot_config,
+    validate_graph_snapshot,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
