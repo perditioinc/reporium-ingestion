@@ -5,7 +5,6 @@ import pytest
 from ingestion.graph_snapshot import (
     GRAPH_SNAPSHOT_VERSION,
     GraphSnapshotConfig,
-    _TYPED_EDGE_PER_TYPE_MAX,
     _balance_typed_edges,
     build_graph_snapshot,
     publish_graph_snapshot,
@@ -120,15 +119,15 @@ def _make_typed_edge(source: str, target: str, edge_type: str, weight: float = 1
     }
 
 
-def test_balance_typed_edges_preserves_all_depends_on_when_under_cap():
-    """All DEPENDS_ON edges survive when count < _TYPED_EDGE_PER_TYPE_MAX."""
+def test_balance_typed_edges_preserves_all_edges_no_cap():
+    """All edges of every type are emitted — no per-type cap is applied."""
     depends_on_edges = [
         _make_typed_edge(f"src-{i}", f"tgt-{i}", "DEPENDS_ON")
         for i in range(60)
     ]
     alt_edges = [
         _make_typed_edge(f"a-{i}", f"b-{i}", "ALTERNATIVE_TO")
-        for i in range(_TYPED_EDGE_PER_TYPE_MAX + 200)
+        for i in range(1200)
     ]
     result = _balance_typed_edges(depends_on_edges + alt_edges)
 
@@ -136,10 +135,9 @@ def test_balance_typed_edges_preserves_all_depends_on_when_under_cap():
     for edge in result:
         result_by_type.setdefault(edge["edge_type"], []).append(edge)
 
-    # All 60 DEPENDS_ON edges must survive
+    # All edges must survive — no cap applied
     assert len(result_by_type.get("DEPENDS_ON", [])) == 60
-    # ALTERNATIVE_TO capped at per-type max
-    assert len(result_by_type.get("ALTERNATIVE_TO", [])) == _TYPED_EDGE_PER_TYPE_MAX
+    assert len(result_by_type.get("ALTERNATIVE_TO", [])) == 1200
 
 
 def test_balance_typed_edges_priority_order():
@@ -161,13 +159,14 @@ def test_balance_typed_edges_priority_order():
     )
 
 
-def test_balance_typed_edges_caps_each_type_independently():
-    """Each type is capped independently; combined count can exceed _TYPED_EDGE_PER_TYPE_MAX."""
+def test_balance_typed_edges_emits_all_edges_for_all_types():
+    """All edges for all types pass through — no cap is applied per type."""
+    n = 1050  # deliberately above the old 1000 cap
     edges = []
     for et in ("DEPENDS_ON", "EXTENDS", "COMPATIBLE_WITH", "ALTERNATIVE_TO"):
         edges += [
             _make_typed_edge(f"{et}-src-{i}", f"{et}-tgt-{i}", et)
-            for i in range(_TYPED_EDGE_PER_TYPE_MAX + 50)
+            for i in range(n)
         ]
     result = _balance_typed_edges(edges)
 
@@ -176,8 +175,8 @@ def test_balance_typed_edges_caps_each_type_independently():
         result_by_type[edge["edge_type"]] = result_by_type.get(edge["edge_type"], 0) + 1
 
     for et in ("DEPENDS_ON", "EXTENDS", "COMPATIBLE_WITH", "ALTERNATIVE_TO"):
-        assert result_by_type.get(et, 0) == _TYPED_EDGE_PER_TYPE_MAX, (
-            f"{et} should be capped at {_TYPED_EDGE_PER_TYPE_MAX}"
+        assert result_by_type.get(et, 0) == n, (
+            f"{et}: expected {n} edges, got {result_by_type.get(et, 0)}"
         )
 
 
@@ -218,10 +217,9 @@ def test_snapshot_regression_guard_depends_on_not_dropped():
         by_type[edge["edge_type"]] = by_type.get(edge["edge_type"], 0) + 1
 
     assert by_type.get("DEPENDS_ON", 0) == 60, (
-        "Regression guard: all 60 DEPENDS_ON edges must survive balancing"
+        "Regression guard: all 60 DEPENDS_ON edges must survive — no cap applied"
     )
-    # 800 ALTERNATIVE_TO edges < 1000 cap, so all survive (no trimming needed here).
-    # Trimming behaviour is covered by test_balance_typed_edges_caps_each_type_independently.
+    # All 800 ALTERNATIVE_TO edges must also survive (no cap).
     assert by_type.get("ALTERNATIVE_TO", 0) == 800, (
-        "Regression guard: ALTERNATIVE_TO edges must be preserved when under the cap"
+        "Regression guard: all ALTERNATIVE_TO edges must be preserved — no cap applied"
     )

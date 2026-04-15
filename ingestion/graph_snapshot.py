@@ -13,13 +13,10 @@ logger = logging.getLogger(__name__)
 
 GRAPH_SNAPSHOT_VERSION = 1
 
-# Per-type cap applied when writing the snapshot. Keeps ALTERNATIVE_TO (which can
-# reach O(n²) at weight=1.0) from crowding out DEPENDS_ON/EXTENDS in the serving
-# layer. Cap is generous — real DEPENDS_ON counts are usually < 300.
-_TYPED_EDGE_PER_TYPE_MAX = 1000
-
-# Priority order: higher-semantic-value types appear first so the API reader's
-# per-request limit always includes the most important edges.
+# Priority order: higher-semantic-value types appear first so the API reader
+# always encounters the most important edges first.  No per-type cap is applied
+# here — "show all" means all.  The old 1000-per-type hard cap was removed
+# (KAN-XXX) because server-side truncation is as harmful as a client-side cap.
 _TYPED_EDGE_PRIORITY = ("DEPENDS_ON", "EXTENDS", "COMPATIBLE_WITH", "ALTERNATIVE_TO")
 DEFAULT_GRAPH_SNAPSHOT_OBJECT = "reporium/graph/knowledge-graph.json"
 
@@ -36,12 +33,11 @@ class GraphSnapshotConfig:
 
 
 def _balance_typed_edges(edges: list[dict]) -> list[dict]:
-    """Cap each typed edge type at _TYPED_EDGE_PER_TYPE_MAX (by descending weight).
+    """Reorder typed edges so higher-priority types appear first in the output.
 
-    Guarantees that no single type (e.g. ALTERNATIVE_TO with O(n²) weight=1.0
-    pairs) starves higher-priority types when the API reader applies its
-    per-request typed_cap.  Within each type edges are already ordered by the
-    SQL query (weight DESC), so slicing preserves the best edges.
+    No per-type cap is applied — every edge emitted by the generator is kept.
+    Priority ordering ensures the API reader encounters DEPENDS_ON / EXTENDS
+    before ALTERNATIVE_TO regardless of DB insertion order.
     """
     per_type: dict[str, list[dict]] = {}
     for edge in edges:
@@ -51,12 +47,12 @@ def _balance_typed_edges(edges: list[dict]) -> list[dict]:
     seen_types: set[str] = set()
     for et in _TYPED_EDGE_PRIORITY:
         if et in per_type:
-            result.extend(per_type[et][:_TYPED_EDGE_PER_TYPE_MAX])
+            result.extend(per_type[et])
             seen_types.add(et)
     # Append any edge types not listed in _TYPED_EDGE_PRIORITY
     for et, type_edges in per_type.items():
         if et not in seen_types:
-            result.extend(type_edges[:_TYPED_EDGE_PER_TYPE_MAX])
+            result.extend(type_edges)
     return result
 
 
@@ -220,13 +216,6 @@ def build_graph_snapshot(
     ]
 
     balanced_typed_edges = _balance_typed_edges(typed_edges)
-    if len(balanced_typed_edges) < len(typed_edges):
-        logger.info(
-            "Typed edge balancing trimmed %d edges (%d → %d)",
-            len(typed_edges) - len(balanced_typed_edges),
-            len(typed_edges),
-            len(balanced_typed_edges),
-        )
 
     return {
         "snapshot_version": GRAPH_SNAPSHOT_VERSION,
