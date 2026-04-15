@@ -34,6 +34,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           INGEST_RUN_ID: ${{ github.event.inputs.ingest_run_id || '' }}
+          PYTHONPATH: ${{ github.workspace }}
         run: python scripts/build_knowledge_graph.py
 
       - name: Trigger graph snapshot rebuild via reporium-api admin endpoint
