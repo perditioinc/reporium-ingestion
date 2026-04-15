@@ -35,7 +35,7 @@ jobs:
         run: |
           # Download cloud-sql-proxy v2.x
           PROXY_VERSION="2.11.4"
-          curl -o cloud-sql-proxy https://dl.google.com/cloudsql/cloud-sql-proxy.linux.amd64
+          curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${PROXY_VERSION}/cloud-sql-proxy.linux.amd64
           chmod +x cloud-sql-proxy
 
           # Start the proxy in background
