@@ -41,6 +41,7 @@ jobs:
           # Start the proxy in background
           ./cloud-sql-proxy "${{ secrets.CLOUD_SQL_CONNECTION_NAME }}" \
             --private-ip \
+            --address 127.0.0.1 \
             --port=5432 \
             --max-connections=5 &
           PROXY_PID=$!
