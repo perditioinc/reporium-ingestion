@@ -223,6 +223,60 @@ Configure via: `QUICK_SCHEDULE`, `WEEKLY_SCHEDULE`, `FULL_SCHEDULE` env vars.
 
 ---
 
+## Cloud SQL Access in CI
+
+The nightly GitHub Actions workflow (`Nightly Graph Build`) rebuilds the knowledge graph by running `scripts/build_knowledge_graph.py`, which populates ALTERNATIVE_TO, COMPATIBLE_WITH, and DEPENDS_ON edges in Cloud SQL.
+
+Since the Cloud SQL instance (`reporium-db`) has no public IP and uses private networking, the workflow uses **Cloud SQL Auth Proxy** to establish a secure tunnel on `127.0.0.1:5432`.
+
+### Setup (One-time)
+
+1. Create a GCP service account scoped to Cloud SQL:
+   ```bash
+   gcloud iam service-accounts create reporium-ingestion-ci
+   gcloud projects add-iam-policy-binding <project> \
+     --member="serviceAccount:reporium-ingestion-ci@<project>.iam.gserviceaccount.com" \
+     --role="roles/cloudsql.client"
+   gcloud projects add-iam-policy-binding <project> \
+     --member="serviceAccount:reporium-ingestion-ci@<project>.iam.gserviceaccount.com" \
+     --role="roles/cloudsql.instanceUser"
+   ```
+
+2. Generate a JSON key and upload to GitHub Secrets:
+   ```bash
+   gcloud iam service-accounts keys create /tmp/key.json \
+     --iam-account=reporium-ingestion-ci@<project>.iam.gserviceaccount.com
+   gh secret set GCP_SA_KEY --repo perditioinc/reporium-ingestion < /tmp/key.json
+   rm /tmp/key.json
+   ```
+
+3. Also set database and connection name secrets:
+   ```bash
+   gh secret set DATABASE_URL --repo perditioinc/reporium-ingestion --body "postgresql://user:pass@127.0.0.1:5432/reporium"
+   gh secret set CLOUD_SQL_CONNECTION_NAME --repo perditioinc/reporium-ingestion --body "project:region:instance"
+   ```
+
+### Key Rotation
+
+The JSON key above should be rotated every **90 days** (next due: July 15, 2026). To rotate:
+
+```bash
+# List old keys
+gcloud iam service-accounts keys list --iam-account=reporium-ingestion-ci@<project>.iam.gserviceaccount.com
+
+# Delete old keys (keep at most 1 active)
+gcloud iam service-accounts keys delete <key-id> \
+  --iam-account=reporium-ingestion-ci@<project>.iam.gserviceaccount.com
+
+# Generate new key and update GitHub secret
+gcloud iam service-accounts keys create /tmp/key.json \
+  --iam-account=reporium-ingestion-ci@<project>.iam.gserviceaccount.com
+gh secret set GCP_SA_KEY --repo perditioinc/reporium-ingestion < /tmp/key.json
+rm /tmp/key.json
+```
+
+---
+
 ## Tests
 
 ```bash
