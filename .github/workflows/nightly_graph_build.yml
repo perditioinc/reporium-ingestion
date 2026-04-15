@@ -11,10 +11,6 @@ on:
         description: "ingest_runs.id to tag edges with (optional)"
         required: false
         default: ""
-      resume_crashed_run:
-        description: "Resume a crashed run (1 = yes)"
-        required: false
-        default: "0"
 
 permissions:
   contents: read
@@ -25,47 +21,50 @@ jobs:
     if: always()
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Build knowledge graph edges
+      - name: Trigger graph snapshot rebuild via reporium-api admin endpoint
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          INGEST_RUN_ID: ${{ github.event.inputs.ingest_run_id || '' }}
-          RESUME_CRASHED_RUN: ${{ github.event.inputs.resume_crashed_run || '1' }}
-          GRAPH_SNAPSHOT_BUCKET: perditio-platform-bucket
-          GRAPH_SNAPSHOT_OBJECT: reporium/graph/knowledge-graph.json
-        run: python scripts/build_knowledge_graph.py
-
-      - name: Report edge counts
-        if: always()
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ADMIN_API_KEY: ${{ secrets.REPORIUM_ADMIN_API_KEY }}
+          API_URL: https://reporium-api-wypbzj5gpa-uc.a.run.app
         run: |
-          python - <<'EOF'
-          import os, psycopg2
-          conn = psycopg2.connect(os.environ["DATABASE_URL"])
-          cur = conn.cursor()
-          cur.execute("SELECT edge_type, COUNT(*) FROM repo_edges GROUP BY edge_type ORDER BY edge_type;")
-          rows = cur.fetchall()
-          total = sum(r[1] for r in rows)
-          print(f"repo_edges summary (total={total}):")
-          for edge_type, count in rows:
-              print(f"  {edge_type}: {count}")
-          # Alert if DEPENDS_ON is 0 — likely indicates repo_dependencies is empty
-          depends_count = next((r[1] for r in rows if r[0] == "DEPENDS_ON"), 0)
-          if depends_count == 0:
-              print("::warning::DEPENDS_ON edge count is 0 — repo_dependencies may be empty. Run dependency extraction.")
-          conn.close()
-          EOF
+          echo "Triggering /admin/graph/rebuild-snapshot ..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "${API_URL}/admin/graph/rebuild-snapshot" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Length: 0" \
+            --max-time 600)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -1)
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response: $BODY"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Graph snapshot rebuild failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+          # Parse and log stats from response
+          echo "$BODY" | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          print(f\"Snapshot rebuilt: {d.get('nodes')} nodes, {d.get('similarity_edges')} sim edges, {d.get('typed_edges')} typed edges\")
+          print(f\"Typed edge breakdown: {d.get('typed_edge_breakdown')}\")
+          print(f\"Size: {d.get('size_kb')} KB\")
+          nodes = d.get('nodes', 0)
+          if nodes < 1500:
+              print(f'::warning::Node count {nodes} is below 1500 — enrichment may be incomplete')
+          typed = d.get('typed_edges', 0)
+          if typed < 50:
+              print(f'::warning::Typed edge count {typed} is low — repo_dependencies may need backfill')
+          "
+
+      - name: Verify graph endpoint returns fresh data
+        env:
+          API_URL: https://reporium-api-wypbzj5gpa-uc.a.run.app
+        run: |
+          echo "Verifying /graph/edges returns updated data..."
+          RESPONSE=$(curl -s "${API_URL}/graph/edges?limit=100")
+          TOTAL=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('total_public_repos', 0))")
+          EDGE_TYPES=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('edgeTypes', []))")
+          echo "total_public_repos: $TOTAL"
+          echo "edge_types: $EDGE_TYPES"
+          if [ "$TOTAL" -lt 1500 ]; then
+            echo "::warning::total_public_repos=$TOTAL is below 1500"
+          fi
