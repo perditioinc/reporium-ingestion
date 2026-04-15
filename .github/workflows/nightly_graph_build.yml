@@ -43,8 +43,7 @@ jobs:
             --private-ip \
             --address 127.0.0.1 \
             --port=5432 \
-            --max-connections=5 \
-            --auto-iam-authn &
+            --max-connections=5 &
           PROXY_PID=$!
           echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
 
