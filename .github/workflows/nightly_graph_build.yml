@@ -21,6 +21,26 @@ jobs:
     if: always()
 
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build knowledge graph edges (ALTERNATIVE_TO, COMPATIBLE_WITH, DEPENDS_ON)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          INGEST_RUN_ID: ${{ github.event.inputs.ingest_run_id || '' }}
+        run: python scripts/build_knowledge_graph.py
+
       - name: Trigger graph snapshot rebuild via reporium-api admin endpoint
         env:
           ADMIN_API_KEY: ${{ secrets.REPORIUM_ADMIN_API_KEY }}
@@ -53,6 +73,10 @@ jobs:
           typed = d.get('typed_edges', 0)
           if typed < 50:
               print(f'::warning::Typed edge count {typed} is low — repo_dependencies may need backfill')
+          if d.get('typed_edge_breakdown', {}).get('ALTERNATIVE_TO', 0) == 0:
+              print(f'::warning::ALTERNATIVE_TO edge count is 0')
+          if d.get('typed_edge_breakdown', {}).get('COMPATIBLE_WITH', 0) == 0:
+              print(f'::warning::COMPATIBLE_WITH edge count is 0')
           "
 
       - name: Verify graph endpoint returns fresh data
