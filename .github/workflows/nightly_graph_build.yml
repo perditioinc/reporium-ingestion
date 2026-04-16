@@ -29,8 +29,7 @@ jobs:
           gcloud run jobs execute reporium-graph-build \
             --project=perditio-platform \
             --region=us-central1 \
-            --wait \
-            --wait-timeout=600
+            --wait
           echo "Cloud Run Job completed successfully"
 
       - name: Trigger graph snapshot rebuild via reporium-api admin endpoint
