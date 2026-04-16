@@ -25,6 +25,7 @@ class FetchedRepo:
         self.behind_by: int = 0
         self.ahead_by: int = 0
         self.upstream_created_at: str | None = None
+        self.upstream_last_push_at: str | None = None
         self.original_owner: str | None = None
         self.parent_stars: int = 0
         self.parent_forks: int = 0
@@ -135,6 +136,7 @@ class RepoFetcher:
             fork_info = await self.client.get_fork_info(repo.owner, repo.name)
             if fork_info:
                 fetched.upstream_created_at = fork_info.upstream_created_at
+                fetched.upstream_last_push_at = fork_info.upstream_pushed_at
                 fetched.original_owner = fork_info.upstream_owner
                 fetched.parent_stars = fork_info.parent_stars
                 fetched.parent_forks = fork_info.parent_forks
@@ -142,6 +144,9 @@ class RepoFetcher:
         else:
             fetched.original_owner = repo.owner
             fetched.upstream_created_at = repo.created_at
+            # For repos you own outright, "upstream" IS you, so both push timestamps
+            # coincide. Setting this keeps the timeline card populated for built repos.
+            fetched.upstream_last_push_at = repo.pushed_at
 
     async def _fetch_daily(self, fetched: FetchedRepo) -> None:
         repo = fetched.github_repo

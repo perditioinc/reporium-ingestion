@@ -223,6 +223,13 @@ async def _to_api_payload(
         'commits_last_7_days': commit_stats['last7Days'],
         'commits_last_30_days': commit_stats['last30Days'],
         'commits_last_90_days': commit_stats['last90Days'],
+        # Timeline fields — powers the "Your last push / Upstream last push /
+        # Last indexed" card on the repo detail page. The DB columns have always
+        # existed, but the ingestion payload omitted them, so the frontend
+        # timeline was frozen to whatever was backfilled manually.
+        'github_updated_at': repo.updated_at,
+        'your_last_push_at': repo.pushed_at,
+        'upstream_last_push_at': fetched.upstream_last_push_at,
         'readme_summary': summary,
         **_compute_activity_score(
             stars=repo.stars or 0,
