@@ -51,6 +51,10 @@ def get_db_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
         raise RuntimeError("Set DATABASE_URL")
+    # Secret Manager stores SQLAlchemy-style 'postgresql+psycopg2://' but
+    # psycopg2.connect() only accepts 'postgresql://' (no dialect suffix).
+    if url.startswith("postgresql+psycopg2://"):
+        url = "postgresql://" + url[len("postgresql+psycopg2://"):]
     return url
 
 

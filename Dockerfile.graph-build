@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install only what the graph build needs (no ML / sentence-transformers)
+COPY requirements-graph.txt .
+RUN pip install --no-cache-dir -r requirements-graph.txt
+
+COPY ingestion/ ingestion/
+COPY scripts/build_knowledge_graph.py scripts/
+
+ENV PYTHONPATH=/app
+CMD ["python", "scripts/build_knowledge_graph.py"]
