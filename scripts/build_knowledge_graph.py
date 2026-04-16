@@ -394,87 +394,95 @@ def build_depends_on(cur):
 
 def build_extends(cur):
     """
-    Create EXTENDS edges from GitHub fork relationships.
+    Create EXTENDS edges between repos that share an upstream owner.
 
-    For every repo with `forked_from = "owner/repo"` whose parent is also
-    present in the DB (matched by `owner/name`), emit an edge:
-        fork --EXTENDS--> parent
+    Semantic: "repos extending the same upstream organization's ecosystem."
+    All of our repos are perditioinc/* forks of public projects, so a true
+    "fork-of-fork" parent->child relationship doesn't exist in the DB.
+    Instead, we group repos by the OWNER component of their `forked_from`
+    upstream. Repos sharing an upstream owner (e.g. all facebook/* forks,
+    all google/* forks) are linked: they extend the same project family.
 
-    Confidence = 1.0 (deterministic — sourced from the GitHub fork API).
+    Examples:
+        facebook/react       <-EXTENDS-> facebook/react-native
+        google/jax           <-EXTENDS-> google/flax
+        microsoft/typescript <-EXTENDS-> microsoft/vscode
 
-    Notes:
-      - We match on the canonical "owner/name" form. Some repos store
-        forked_from without the owner; those are skipped (we have no way
-        to disambiguate which "react" they forked from).
-      - Self-references and pairs where parent == fork are filtered.
-      - Returns one edge per fork relationship; no top-K cap (each fork
-        has at most one parent, so cardinality is bounded by repo count).
+    Top-K-per-repo cap protects against giant orgs (microsoft/* etc.) creating
+    O(n^2) edge counts. Confidence = 0.6 (heuristic, weaker than DEPENDS_ON
+    but stronger than the keyword-fallback ALTERNATIVE_TO).
     """
+    MAX_PER_REPO = 20
+    MIN_GROUP_SIZE = 2
+    MAX_GROUP_SIZE = 30  # skip groups bigger than this — too noisy to be useful
+
     logger.info("Building EXTENDS edges...")
 
     cur.execute("""
-        SELECT id, name, owner, forked_from
+        SELECT id, name, forked_from
         FROM repos
-        WHERE forked_from IS NOT NULL AND forked_from != '';
+        WHERE forked_from IS NOT NULL AND forked_from != '' AND forked_from LIKE '%/%';
     """)
-    forks = cur.fetchall()
-    logger.info(f"  Repos with forked_from set: {len(forks)}")
+    rows = cur.fetchall()
+    logger.info(f"  Repos with parsable forked_from: {len(rows)}")
 
-    if not forks:
+    if not rows:
         return []
 
-    # Build owner/name → repo index for the whole DB
-    cur.execute("SELECT id, name, owner, forked_from FROM repos;")
-    by_full_name: dict[str, dict] = {}
-    for repo_id, name, owner, forked_from in cur.fetchall():
-        if owner and name:
-            key = f"{owner}/{name}".lower()
-            by_full_name[key] = {
-                "id": repo_id,
-                "name": name,
-                "owner": owner,
-                "forked_from": forked_from,
-            }
+    # Group repos by upstream owner
+    by_owner = defaultdict(list)
+    for repo_id, name, forked_from in rows:
+        upstream_owner = forked_from.split("/", 1)[0].strip().lower()
+        if not upstream_owner:
+            continue
+        by_owner[upstream_owner].append({
+            "id": repo_id,
+            "name": name,
+            "forked_from": forked_from,
+        })
 
-    logger.info(f"  Owner/name index size: {len(by_full_name)}")
+    eligible_groups = {o: r for o, r in by_owner.items()
+                       if MIN_GROUP_SIZE <= len(r) <= MAX_GROUP_SIZE}
+    logger.info(
+        "  Upstream owners: %d total, %d eligible (size %d-%d)",
+        len(by_owner), len(eligible_groups), MIN_GROUP_SIZE, MAX_GROUP_SIZE,
+    )
+
+    # Top-K-per-repo: collect candidates per repo, keep strongest by group size
+    repo_candidates = defaultdict(list)
+    for owner, repos in eligible_groups.items():
+        # Smaller groups are more meaningful — invert size for weight
+        weight = 1.0 / max(len(repos) - 1, 1)
+        for r1, r2 in combinations(repos, 2):
+            pair_key = tuple(sorted([str(r1["id"]), str(r2["id"])]))
+            entry = (weight, pair_key, owner, r1, r2)
+            repo_candidates[str(r1["id"])].append(entry)
+            repo_candidates[str(r2["id"])].append(entry)
+
+    selected = {}
+    for repo_id, candidates in repo_candidates.items():
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for weight, pair_key, owner, r1, r2 in candidates[:MAX_PER_REPO]:
+            if pair_key not in selected:
+                selected[pair_key] = (weight, owner, r1, r2)
 
     edges = []
-    matched = 0
-    skipped_no_owner = 0
-    skipped_self = 0
-    skipped_parent_missing = 0
-    for fork_id, fork_name, fork_owner, parent_full in forks:
-        parent_full = (parent_full or "").strip()
-        if "/" not in parent_full:
-            skipped_no_owner += 1
-            continue
-        parent_key = parent_full.lower()
-        parent = by_full_name.get(parent_key)
-        if not parent:
-            skipped_parent_missing += 1
-            continue
-        if str(fork_id) == str(parent["id"]):
-            skipped_self += 1
-            continue
-
-        matched += 1
-        fork_label = f"{fork_owner}/{fork_name}" if fork_owner else fork_name
+    for pair_key, (weight, owner, r1, r2) in selected.items():
         edges.append({
-            "source": fork_id,
-            "target": parent["id"],
-            "weight": 1.0,
-            "confidence": 1.0,  # deterministic from GitHub fork relationship
+            "source": r1["id"],
+            "target": r2["id"],
+            "weight": weight,
+            "confidence": 0.6,  # heuristic — same upstream owner != strict extension
             "evidence": {
-                "method": "github_fork_relationship",
-                "parent": parent_full,
+                "method": "shared_upstream_owner",
+                "upstream_owner": owner,
             },
-            "source_name": fork_label,
-            "target_name": parent_full,
+            "source_name": r1["forked_from"] or r1["name"],
+            "target_name": r2["forked_from"] or r2["name"],
         })
 
     logger.info(
-        "  EXTENDS edges: %d  (matched=%d, missing_owner=%d, parent_not_in_db=%d, self=%d)",
-        len(edges), matched, skipped_no_owner, skipped_parent_missing, skipped_self,
+        f"  EXTENDS edges (shared upstream owner, top-{MAX_PER_REPO}/repo): {len(edges)}"
     )
     return edges
 
