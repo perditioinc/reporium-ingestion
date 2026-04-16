@@ -392,6 +392,93 @@ def build_depends_on(cur):
     return edges
 
 
+def build_extends(cur):
+    """
+    Create EXTENDS edges from GitHub fork relationships.
+
+    For every repo with `forked_from = "owner/repo"` whose parent is also
+    present in the DB (matched by `owner/name`), emit an edge:
+        fork --EXTENDS--> parent
+
+    Confidence = 1.0 (deterministic — sourced from the GitHub fork API).
+
+    Notes:
+      - We match on the canonical "owner/name" form. Some repos store
+        forked_from without the owner; those are skipped (we have no way
+        to disambiguate which "react" they forked from).
+      - Self-references and pairs where parent == fork are filtered.
+      - Returns one edge per fork relationship; no top-K cap (each fork
+        has at most one parent, so cardinality is bounded by repo count).
+    """
+    logger.info("Building EXTENDS edges...")
+
+    cur.execute("""
+        SELECT id, name, owner, forked_from
+        FROM repos
+        WHERE forked_from IS NOT NULL AND forked_from != '';
+    """)
+    forks = cur.fetchall()
+    logger.info(f"  Repos with forked_from set: {len(forks)}")
+
+    if not forks:
+        return []
+
+    # Build owner/name → repo index for the whole DB
+    cur.execute("SELECT id, name, owner, forked_from FROM repos;")
+    by_full_name: dict[str, dict] = {}
+    for repo_id, name, owner, forked_from in cur.fetchall():
+        if owner and name:
+            key = f"{owner}/{name}".lower()
+            by_full_name[key] = {
+                "id": repo_id,
+                "name": name,
+                "owner": owner,
+                "forked_from": forked_from,
+            }
+
+    logger.info(f"  Owner/name index size: {len(by_full_name)}")
+
+    edges = []
+    matched = 0
+    skipped_no_owner = 0
+    skipped_self = 0
+    skipped_parent_missing = 0
+    for fork_id, fork_name, fork_owner, parent_full in forks:
+        parent_full = (parent_full or "").strip()
+        if "/" not in parent_full:
+            skipped_no_owner += 1
+            continue
+        parent_key = parent_full.lower()
+        parent = by_full_name.get(parent_key)
+        if not parent:
+            skipped_parent_missing += 1
+            continue
+        if str(fork_id) == str(parent["id"]):
+            skipped_self += 1
+            continue
+
+        matched += 1
+        fork_label = f"{fork_owner}/{fork_name}" if fork_owner else fork_name
+        edges.append({
+            "source": fork_id,
+            "target": parent["id"],
+            "weight": 1.0,
+            "confidence": 1.0,  # deterministic from GitHub fork relationship
+            "evidence": {
+                "method": "github_fork_relationship",
+                "parent": parent_full,
+            },
+            "source_name": fork_label,
+            "target_name": parent_full,
+        })
+
+    logger.info(
+        "  EXTENDS edges: %d  (matched=%d, missing_owner=%d, parent_not_in_db=%d, self=%d)",
+        len(edges), matched, skipped_no_owner, skipped_parent_missing, skipped_self,
+    )
+    return edges
+
+
 # ---------------------------------------------------------------------------
 # Edge insertion
 # ---------------------------------------------------------------------------
