@@ -6,11 +6,6 @@ on:
     - cron: "30 8 * * *"
   # Also allow manual trigger for on-demand rebuilds
   workflow_dispatch:
-    inputs:
-      ingest_run_id:
-        description: "ingest_runs.id to tag edges with (optional)"
-        required: false
-        default: ""
 
 permissions:
   contents: read
@@ -18,11 +13,8 @@ permissions:
 jobs:
   build-graph:
     runs-on: ubuntu-latest
-    if: always()
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -31,49 +23,14 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Download and start Cloud SQL Auth Proxy
+      - name: Execute Cloud Run Job (build edges)
         run: |
-          # Download cloud-sql-proxy v2.x
-          PROXY_VERSION="2.11.4"
-          curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${PROXY_VERSION}/cloud-sql-proxy.linux.amd64
-          chmod +x cloud-sql-proxy
-
-          # Start the proxy in background
-          ./cloud-sql-proxy "${{ secrets.CLOUD_SQL_CONNECTION_NAME }}" \
-            --private-ip \
-            --address 127.0.0.1 \
-            --port=5432 \
-            --max-connections=5 &
-          PROXY_PID=$!
-          echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
-
-          # Wait for proxy to be ready (max 30s)
-          for i in {1..30}; do
-            if nc -z 127.0.0.1 5432; then
-              echo "Cloud SQL Auth Proxy is listening on 127.0.0.1:5432"
-              break
-            fi
-            if [ $i -eq 30 ]; then
-              echo "::error::Cloud SQL Auth Proxy failed to start"
-              exit 1
-            fi
-            echo "Waiting for proxy... ($i/30)"
-            sleep 1
-          done
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Build knowledge graph edges (ALTERNATIVE_TO, COMPATIBLE_WITH, DEPENDS_ON)
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          INGEST_RUN_ID: ${{ github.event.inputs.ingest_run_id || '' }}
-          PYTHONPATH: ${{ github.workspace }}
-        run: python scripts/build_knowledge_graph.py
+          echo "Triggering reporium-graph-build Cloud Run Job..."
+          gcloud run jobs execute reporium-graph-build \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --wait
+          echo "Cloud Run Job completed successfully"
 
       - name: Trigger graph snapshot rebuild via reporium-api admin endpoint
         env:
@@ -94,7 +51,6 @@ jobs:
             echo "::error::Graph snapshot rebuild failed with HTTP $HTTP_CODE"
             exit 1
           fi
-          # Parse and log stats from response
           echo "$BODY" | python3 -c "
           import json, sys
           d = json.load(sys.stdin)
@@ -125,12 +81,4 @@ jobs:
           echo "edge_types: $EDGE_TYPES"
           if [ "$TOTAL" -lt 1500 ]; then
             echo "::warning::total_public_repos=$TOTAL is below 1500"
-          fi
-
-      - name: Cleanup Cloud SQL Auth Proxy
-        if: always()
-        run: |
-          if [ ! -z "$PROXY_PID" ]; then
-            kill $PROXY_PID 2>/dev/null || true
-            echo "Cloud SQL Auth Proxy stopped"
           fi

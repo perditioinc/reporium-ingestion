@@ -1,0 +1,6 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-f', 'Dockerfile.graph-build', '-t', 'us-central1-docker.pkg.dev/perditio-platform/cloud-run-source-deploy/reporium-graph-build:latest', '.']
+images:
+  - 'us-central1-docker.pkg.dev/perditio-platform/cloud-run-source-deploy/reporium-graph-build:latest'
+timeout: 300s
