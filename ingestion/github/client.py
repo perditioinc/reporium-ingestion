@@ -25,6 +25,7 @@ class GitHubRepo(BaseModel):
     topics: list[str] = []
     updated_at: str
     created_at: str
+    pushed_at: str | None = None
     default_branch: str = 'main'
     license_spdx: str | None = None
 
@@ -33,6 +34,9 @@ class ForkInfo(BaseModel):
     upstream_owner: str
     upstream_repo: str
     upstream_created_at: str
+    # Upstream's last push (parent repo's pushed_at) — powers the
+    # "upstream activity" row of the timeline on the repo detail page.
+    upstream_pushed_at: str | None = None
     parent_stars: int = 0
     parent_forks: int = 0
     parent_archived: bool = False
@@ -192,6 +196,9 @@ class GitHubClient:
                     topics=r.get('topics', []),
                     updated_at=r['updated_at'],
                     created_at=r['created_at'],
+                    # pushed_at = timestamp of the user's last push to this repo.
+                    # Falls back to updated_at if the GitHub response omits it (rare but defensive).
+                    pushed_at=r.get('pushed_at') or r['updated_at'],
                     default_branch=r.get('default_branch', 'main'),
                     license_spdx=license_spdx,
                 ))
@@ -209,6 +216,7 @@ class GitHubClient:
             upstream_owner=parent.get('owner', {}).get('login', 'unknown'),
             upstream_repo=parent.get('name', 'unknown'),
             upstream_created_at=parent.get('created_at', ''),
+            upstream_pushed_at=parent.get('pushed_at'),
             parent_stars=parent.get('stargazers_count', 0),
             parent_forks=parent.get('forks_count', 0),
             parent_archived=parent.get('archived', False),
