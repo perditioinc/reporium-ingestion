@@ -13,6 +13,47 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Download and start Cloud SQL Auth Proxy
+        run: |
+          # Mirrors the pattern previously used by nightly_graph_build.yml
+          # (pre-Cloud-Run-Job migration, commit 8b02988^). Instance has no
+          # public IP, so --private-ip is required.
+          PROXY_VERSION="2.11.4"
+          curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${PROXY_VERSION}/cloud-sql-proxy.linux.amd64
+          chmod +x cloud-sql-proxy
+
+          # Start the proxy in background
+          ./cloud-sql-proxy "${{ secrets.CLOUD_SQL_CONNECTION_NAME }}" \
+            --private-ip \
+            --address 127.0.0.1 \
+            --port=5432 \
+            --max-connections=5 &
+          PROXY_PID=$!
+          echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
+
+          # Wait for proxy to be ready (max 30s)
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5432; then
+              echo "Cloud SQL Auth Proxy is listening on 127.0.0.1:5432"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "::error::Cloud SQL Auth Proxy failed to start"
+              exit 1
+            fi
+            echo "Waiting for proxy... ($i/30)"
+            sleep 1
+          done
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -67,3 +108,11 @@ jobs:
           print(f'Done. Enriched {len(repos)} repos.')
           conn.close()
           "
+
+      - name: Cleanup Cloud SQL Auth Proxy
+        if: always()
+        run: |
+          if [ ! -z "$PROXY_PID" ]; then
+            kill $PROXY_PID 2>/dev/null || true
+            echo "Cloud SQL Auth Proxy stopped"
+          fi
