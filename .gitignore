@@ -14,7 +14,7 @@ venv/
 data/
 
 # Cache
-cache/
+/cache/                      # Top-level runtime cache dir only (not ingestion/cache/ source pkg)
 .pytest_cache/
 
 # Build
