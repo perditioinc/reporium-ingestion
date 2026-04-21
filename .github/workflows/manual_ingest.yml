@@ -15,6 +15,9 @@ on:
         description: "Comma-separated repo names to re-ingest (leave blank for all)"
         required: false
         default: ""
+  schedule:
+    # Weekly cadence to keep trend_snapshots populated. Mondays 09:00 UTC.
+    - cron: '0 9 * * 1'
 
 permissions:
   contents: read
@@ -40,9 +43,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_USERNAME: ${{ secrets.GH_USERNAME }}
           REPORIUM_API_URL: ${{ secrets.REPORIUM_API_URL }}
+          # ReporiumAPIClient reads REPORIUM_API_KEY (Bearer) and INGEST_API_KEY (X-Ingest-Key).
+          # After reporium-api PR #182, /ingest/* returns 403 without X-Ingest-Key.
+          REPORIUM_API_KEY: ${{ secrets.REPORIUM_API_KEY }}
+          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          # Preserved in case legacy code paths still read it.
           INGESTION_API_KEY: ${{ secrets.INGESTION_API_KEY }}
         run: |
-          MODE="${{ inputs.mode }}"
+          # Schedule-triggered runs have no `inputs.mode`; default to weekly.
+          MODE="${{ inputs.mode || 'weekly' }}"
           FIX_REPOS="${{ inputs.fix_repos }}"
 
           if [ -n "$FIX_REPOS" ]; then
