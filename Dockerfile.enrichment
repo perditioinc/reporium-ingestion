@@ -1,0 +1,39 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps:
+#  - gh CLI: enrich_new_repos.py shells out to `gh repo list perditioinc` and
+#    `gh auth token` (see scripts/enrich_new_repos.py Phase 0).
+#  - curl/ca-certificates/gnupg: required for the GitHub apt signing key install.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates gnupg \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps: full requirements.txt because enrichment needs
+# sentence-transformers (Phase 4 embeddings), psycopg2-binary, httpx, and
+# google-cloud-secret-manager (get_secret fallback in enrich_new_repos.py).
+# anthropic is imported inside run_ai_enrichment() so it must be installed.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir anthropic google-cloud-secret-manager
+
+# Source: the two scripts the nightly workflow executes end-to-end, plus the
+# supporting ingestion/ package and build_knowledge_graph.py (Phase 5).
+COPY ingestion/ ingestion/
+COPY scripts/ scripts/
+
+ENV PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1
+
+# Default entrypoint runs the same two steps as the deprecated GitHub Actions
+# workflow: commit-stats backfill, then the enrichment driver. Overridable via
+# `gcloud run jobs execute --args=...` for ad-hoc runs.
+CMD ["bash", "-c", "python scripts/fetch_commit_stats.py && python scripts/enrich_new_repos.py"]

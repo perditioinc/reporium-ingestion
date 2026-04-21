@@ -1,0 +1,27 @@
+# Cloud Scheduler trigger for the reporium-enrichment Cloud Run Job.
+#
+# Preserves the 07:00 UTC cadence of the deprecated GitHub Actions workflow
+# (.github/workflows/nightly_enrichment.yml line 5), which was chosen to run
+# AFTER reporium-db sync and BEFORE the 08:30 UTC nightly_graph_build.yml.
+#
+# Mirrors deploy/scheduler.yaml (reporium-ingestion-nightly) exactly — same
+# kind, same oidcToken pattern, same invoker SA.
+#
+# Placeholders substituted at apply-time: PROJECT_ID, REGION.
+apiVersion: cloudscheduler.cnrm.cloud.google.com/v1beta1
+kind: CloudSchedulerJob
+metadata:
+  name: reporium-enrichment-nightly
+spec:
+  location: REGION
+  schedule: "0 7 * * *"
+  timeZone: Etc/UTC
+  httpTarget:
+    httpMethod: POST
+    uri: https://run.googleapis.com/v2/projects/PROJECT_ID/locations/REGION/jobs/reporium-enrichment:run
+    headers:
+      Content-Type: application/json
+    oidcToken:
+      # Same scheduler SA used by the existing reporium-ingestion-nightly
+      # trigger; must hold roles/run.invoker on the reporium-enrichment job.
+      serviceAccountEmail: ingestion-scheduler@PROJECT_ID.iam.gserviceaccount.com
