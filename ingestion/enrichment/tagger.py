@@ -28,6 +28,7 @@ LANGUAGE_TAGS: dict[str, list[str]] = {
     'Elixir': ['Elixir', 'Backend'],
     'Haskell': ['Haskell', 'Systems'],
     'R': ['R', 'Data Science'],
+    'MDX': ['Docs'],
 }
 
 # ── Topic → tag ───────────────────────────────────────────────────────────────
