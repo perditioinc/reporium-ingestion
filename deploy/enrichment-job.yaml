@@ -5,20 +5,34 @@
 # over the socket connector without the Cloud SQL Auth Proxy dance the old
 # workflow required.
 #
-# Pattern mirrors deploy/job.yaml (reporium-ingestion-nightly) and the
-# reporium-graph-build job added in commit 8b02988.
+# Structure mirrors the live reporium-graph-build job exactly (verified via
+# `gcloud run jobs describe reporium-graph-build --region us-central1 -o yaml`
+# on 2026-04-21):
+#   * Runtime annotations live on spec.template.metadata.annotations,
+#     NOT top-level metadata.annotations. Top-level annotations on a
+#     Cloud Run Job are ignored at execution time.
+#   * execution-environment=gen2, network-interfaces (default/default), and
+#     vpc-access-egress=private-ranges-only are all required to reach the
+#     private-IP Cloud SQL instance.
 #
 # Placeholders substituted at apply-time: PROJECT_ID, REGION.
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
   name: reporium-enrichment
-  annotations:
-    # Attach to the same Cloud SQL instance reporium-api uses. Cloud Run Jobs
-    # pick this up via the Unix socket at /cloudsql/<connection>.
-    run.googleapis.com/cloudsql-instances: PROJECT_ID:REGION:reporium-db
 spec:
   template:
+    metadata:
+      annotations:
+        # Attaches the Unix socket at /cloudsql/<connection> inside the container.
+        run.googleapis.com/cloudsql-instances: PROJECT_ID:REGION:reporium-db
+        # gen2 is required for VPC egress + Cloud SQL socket on Cloud Run Jobs.
+        run.googleapis.com/execution-environment: gen2
+        # Direct VPC egress to the default network where reporium-db lives.
+        run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
+        # Only route RFC1918 traffic through the VPC; public APIs (Anthropic,
+        # GitHub) continue to use Cloud Run's default egress.
+        run.googleapis.com/vpc-access-egress: private-ranges-only
     spec:
       template:
         spec:
@@ -28,9 +42,13 @@ spec:
           # Upper bound: ~60 min for a worst-case backfill of several hundred
           # repos at 0.3s/request. Normal nightly runs finish in <10 min.
           timeoutSeconds: 3600
-          # Shared service account with Secret Manager + Cloud SQL Client +
-          # Pub/Sub publisher. Same SA reporium-ingestion-nightly uses.
-          serviceAccountName: reporium-ingestion@PROJECT_ID.iam.gserviceaccount.com
+          # New least-privilege runtime SA (created per deploy/README.md).
+          # Holds ONLY roles/cloudsql.client + accessor on the three secrets
+          # below. Deliberately NOT reusing reporium-ingestion-ci@ (CI deploy
+          # power) or reporium-api@ (broader runtime power) — keeping enrichment
+          # isolated so a compromised enrichment container can't, e.g., publish
+          # to Pub/Sub or touch unrelated secrets.
+          serviceAccountName: reporium-enrichment@PROJECT_ID.iam.gserviceaccount.com
           containers:
             - image: us-central1-docker.pkg.dev/PROJECT_ID/cloud-run-source-deploy/reporium-enrichment:latest
               # Default CMD in Dockerfile.enrichment already runs:
@@ -56,16 +74,18 @@ spec:
                     secretKeyRef:
                       name: anthropic-api-key
                       key: latest
-                # gh CLI reads GH_TOKEN; fetch_commit_stats.py also reads GH_TOKEN.
+                # Scripts read GH_TOKEN / GITHUB_TOKEN env vars. Secret in
+                # live Secret Manager is named `github-token` (hyphenated
+                # lowercase) — the env var names stay as the scripts expect.
                 - name: GH_TOKEN
                   valueFrom:
                     secretKeyRef:
-                      name: GH_TOKEN
+                      name: github-token
                       key: latest
                 - name: GITHUB_TOKEN
                   valueFrom:
                     secretKeyRef:
-                      name: GH_TOKEN
+                      name: github-token
                       key: latest
                 - name: GCP_PROJECT
                   value: PROJECT_ID
