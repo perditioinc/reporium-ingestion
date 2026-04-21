@@ -1,0 +1,71 @@
+# Cloud Run Job: reporium-enrichment
+#
+# Replaces .github/workflows/nightly_enrichment.yml. Runs inside the
+# perditio-platform VPC so it can reach Cloud SQL (reporium-db, private IP)
+# over the socket connector without the Cloud SQL Auth Proxy dance the old
+# workflow required.
+#
+# Pattern mirrors deploy/job.yaml (reporium-ingestion-nightly) and the
+# reporium-graph-build job added in commit 8b02988.
+#
+# Placeholders substituted at apply-time: PROJECT_ID, REGION.
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: reporium-enrichment
+  annotations:
+    # Attach to the same Cloud SQL instance reporium-api uses. Cloud Run Jobs
+    # pick this up via the Unix socket at /cloudsql/<connection>.
+    run.googleapis.com/cloudsql-instances: PROJECT_ID:REGION:reporium-db
+spec:
+  template:
+    spec:
+      template:
+        spec:
+          # Enrichment touches the Anthropic API and GitHub API; one retry is
+          # sufficient — the script is idempotent (WHERE readme_summary IS NULL).
+          maxRetries: 1
+          # Upper bound: ~60 min for a worst-case backfill of several hundred
+          # repos at 0.3s/request. Normal nightly runs finish in <10 min.
+          timeoutSeconds: 3600
+          # Shared service account with Secret Manager + Cloud SQL Client +
+          # Pub/Sub publisher. Same SA reporium-ingestion-nightly uses.
+          serviceAccountName: reporium-ingestion@PROJECT_ID.iam.gserviceaccount.com
+          containers:
+            - image: us-central1-docker.pkg.dev/PROJECT_ID/cloud-run-source-deploy/reporium-enrichment:latest
+              # Default CMD in Dockerfile.enrichment already runs:
+              #   python scripts/fetch_commit_stats.py && python scripts/enrich_new_repos.py
+              # Override via `gcloud run jobs execute --args=...` for ad-hoc runs.
+              resources:
+                limits:
+                  # sentence-transformers loads all-MiniLM-L6-v2 (~90 MB) plus
+                  # torch; 2Gi leaves headroom for the batch encode step.
+                  cpu: "2"
+                  memory: 2Gi
+              env:
+                # DATABASE_URL resolves to the async URL stored in Secret Manager.
+                # enrich_new_repos.py normalizes +asyncpg → psycopg2 automatically
+                # via normalize_db_url() — see scripts/enrich_new_repos.py:56.
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: reporium-db-url-async
+                      key: latest
+                - name: ANTHROPIC_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: anthropic-api-key
+                      key: latest
+                # gh CLI reads GH_TOKEN; fetch_commit_stats.py also reads GH_TOKEN.
+                - name: GH_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: GH_TOKEN
+                      key: latest
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: GH_TOKEN
+                      key: latest
+                - name: GCP_PROJECT
+                  value: PROJECT_ID
