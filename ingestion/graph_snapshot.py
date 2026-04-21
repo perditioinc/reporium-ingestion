@@ -12,6 +12,12 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 GRAPH_SNAPSHOT_VERSION = 1
+
+# Priority order: higher-semantic-value types appear first so the API reader
+# always encounters the most important edges first.  No per-type cap is applied
+# here — "show all" means all.  The old 1000-per-type hard cap was removed
+# (KAN-XXX) because server-side truncation is as harmful as a client-side cap.
+_TYPED_EDGE_PRIORITY = ("DEPENDS_ON", "EXTENDS", "COMPATIBLE_WITH", "ALTERNATIVE_TO")
 DEFAULT_GRAPH_SNAPSHOT_OBJECT = "reporium/graph/knowledge-graph.json"
 
 
@@ -24,6 +30,30 @@ class GraphSnapshotConfig:
     @property
     def enabled(self) -> bool:
         return bool(self.bucket_name or self.local_path)
+
+
+def _balance_typed_edges(edges: list[dict]) -> list[dict]:
+    """Reorder typed edges so higher-priority types appear first in the output.
+
+    No per-type cap is applied — every edge emitted by the generator is kept.
+    Priority ordering ensures the API reader encounters DEPENDS_ON / EXTENDS
+    before ALTERNATIVE_TO regardless of DB insertion order.
+    """
+    per_type: dict[str, list[dict]] = {}
+    for edge in edges:
+        per_type.setdefault(edge["edge_type"], []).append(edge)
+
+    result: list[dict] = []
+    seen_types: set[str] = set()
+    for et in _TYPED_EDGE_PRIORITY:
+        if et in per_type:
+            result.extend(per_type[et])
+            seen_types.add(et)
+    # Append any edge types not listed in _TYPED_EDGE_PRIORITY
+    for et, type_edges in per_type.items():
+        if et not in seen_types:
+            result.extend(type_edges)
+    return result
 
 
 def resolve_graph_snapshot_config() -> GraphSnapshotConfig:
@@ -185,6 +215,8 @@ def build_graph_snapshot(
         for source_repo_id, target_repo_id, edge_type, weight in cur.fetchall()
     ]
 
+    balanced_typed_edges = _balance_typed_edges(typed_edges)
+
     return {
         "snapshot_version": GRAPH_SNAPSHOT_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -196,11 +228,11 @@ def build_graph_snapshot(
             "total_public_repos": int(total_public_repos or 0),
             "repos_with_embeddings": int(repos_with_embeddings or 0),
             "similarity_edges": len(similarity_edges),
-            "typed_edges": len(typed_edges),
+            "typed_edges": len(balanced_typed_edges),
         },
         "nodes": nodes,
         "similarity_edges": similarity_edges,
-        "typed_edges": typed_edges,
+        "typed_edges": balanced_typed_edges,
     }
 
 

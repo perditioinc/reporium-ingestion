@@ -5,6 +5,7 @@ import pytest
 from ingestion.graph_snapshot import (
     GRAPH_SNAPSHOT_VERSION,
     GraphSnapshotConfig,
+    _balance_typed_edges,
     build_graph_snapshot,
     publish_graph_snapshot,
 )
@@ -103,3 +104,122 @@ def _utc_datetime(value: str):
     from datetime import datetime
 
     return datetime.fromisoformat(value)
+
+
+# ---------------------------------------------------------------------------
+# KAN-121: Typed edge balancing
+# ---------------------------------------------------------------------------
+
+def _make_typed_edge(source: str, target: str, edge_type: str, weight: float = 1.0) -> dict:
+    return {
+        "source_repo_id": source,
+        "target_repo_id": target,
+        "edge_type": edge_type,
+        "weight": weight,
+    }
+
+
+def test_balance_typed_edges_preserves_all_edges_no_cap():
+    """All edges of every type are emitted — no per-type cap is applied."""
+    depends_on_edges = [
+        _make_typed_edge(f"src-{i}", f"tgt-{i}", "DEPENDS_ON")
+        for i in range(60)
+    ]
+    alt_edges = [
+        _make_typed_edge(f"a-{i}", f"b-{i}", "ALTERNATIVE_TO")
+        for i in range(1200)
+    ]
+    result = _balance_typed_edges(depends_on_edges + alt_edges)
+
+    result_by_type: dict[str, list] = {}
+    for edge in result:
+        result_by_type.setdefault(edge["edge_type"], []).append(edge)
+
+    # All edges must survive — no cap applied
+    assert len(result_by_type.get("DEPENDS_ON", [])) == 60
+    assert len(result_by_type.get("ALTERNATIVE_TO", [])) == 1200
+
+
+def test_balance_typed_edges_priority_order():
+    """DEPENDS_ON appears before ALTERNATIVE_TO in the output list."""
+    edges = (
+        [_make_typed_edge(f"a-{i}", f"b-{i}", "ALTERNATIVE_TO") for i in range(5)]
+        + [_make_typed_edge(f"d-{i}", f"e-{i}", "DEPENDS_ON") for i in range(5)]
+    )
+    result = _balance_typed_edges(edges)
+    types_in_order = [e["edge_type"] for e in result]
+    last_depends_on = max(
+        (i for i, t in enumerate(types_in_order) if t == "DEPENDS_ON"), default=-1
+    )
+    first_alternative = min(
+        (i for i, t in enumerate(types_in_order) if t == "ALTERNATIVE_TO"), default=999
+    )
+    assert last_depends_on < first_alternative, (
+        "DEPENDS_ON must appear before ALTERNATIVE_TO in the balanced output"
+    )
+
+
+def test_balance_typed_edges_emits_all_edges_for_all_types():
+    """All edges for all types pass through — no cap is applied per type."""
+    n = 1050  # deliberately above the old 1000 cap
+    edges = []
+    for et in ("DEPENDS_ON", "EXTENDS", "COMPATIBLE_WITH", "ALTERNATIVE_TO"):
+        edges += [
+            _make_typed_edge(f"{et}-src-{i}", f"{et}-tgt-{i}", et)
+            for i in range(n)
+        ]
+    result = _balance_typed_edges(edges)
+
+    result_by_type: dict[str, int] = {}
+    for edge in result:
+        result_by_type[edge["edge_type"]] = result_by_type.get(edge["edge_type"], 0) + 1
+
+    for et in ("DEPENDS_ON", "EXTENDS", "COMPATIBLE_WITH", "ALTERNATIVE_TO"):
+        assert result_by_type.get(et, 0) == n, (
+            f"{et}: expected {n} edges, got {result_by_type.get(et, 0)}"
+        )
+
+
+def test_snapshot_regression_guard_depends_on_not_dropped():
+    """Regression guard: snapshot with 60 DEPENDS_ON edges retains all of them after build."""
+    depends_on_rows = [
+        (f"src-{i}", f"tgt-{i}", "DEPENDS_ON", 1.0)
+        for i in range(60)
+    ]
+    alt_rows = [
+        (f"a-{i}", f"b-{i}", "ALTERNATIVE_TO", 1.0)
+        for i in range(800)
+    ]
+    all_typed_rows = depends_on_rows + alt_rows
+
+    cursor = FakeCursor(
+        [
+            # repos query
+            [
+                (
+                    "repo-1", "repo-a", "perditioinc", "Repo A",
+                    "ai-agents", 100, {"overall": 0.9},
+                    _utc_datetime("2026-04-13T01:00:00+00:00"),
+                ),
+            ],
+            # counts query
+            {"one": (1, 1)},
+            # similarity edges
+            [],
+            # typed edges (60 DEPENDS_ON + 800 ALTERNATIVE_TO)
+            all_typed_rows,
+        ]
+    )
+    snapshot = build_graph_snapshot(cursor)
+
+    by_type: dict[str, int] = {}
+    for edge in snapshot["typed_edges"]:
+        by_type[edge["edge_type"]] = by_type.get(edge["edge_type"], 0) + 1
+
+    assert by_type.get("DEPENDS_ON", 0) == 60, (
+        "Regression guard: all 60 DEPENDS_ON edges must survive — no cap applied"
+    )
+    # All 800 ALTERNATIVE_TO edges must also survive (no cap).
+    assert by_type.get("ALTERNATIVE_TO", 0) == 800, (
+        "Regression guard: all ALTERNATIVE_TO edges must be preserved — no cap applied"
+    )
