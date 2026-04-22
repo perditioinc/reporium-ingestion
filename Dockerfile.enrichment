@@ -18,12 +18,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps: full requirements.txt because enrichment needs
-# sentence-transformers (Phase 4 embeddings), psycopg2-binary, httpx, and
-# google-cloud-secret-manager (get_secret fallback in enrich_new_repos.py).
-# anthropic is imported inside run_ai_enrichment() so it must be installed.
+# sentence-transformers (Phase 4 embeddings) and httpx.
+#
+# psycopg2-binary, anthropic, and google-cloud-secret-manager are NOT in
+# requirements.txt because the wider ingestion library uses aiosqlite and
+# doesn't need them. The legacy GH Actions workflow installed them inline
+# (see .github/workflows/nightly_enrichment.yml line 105 pre-migration);
+# we install them here explicitly for the enrichment job only.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir anthropic google-cloud-secret-manager
+    && pip install --no-cache-dir anthropic google-cloud-secret-manager psycopg2-binary
 
 # Source: the two scripts the nightly workflow executes end-to-end, plus the
 # supporting ingestion/ package and build_knowledge_graph.py (Phase 5).
