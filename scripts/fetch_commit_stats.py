@@ -23,16 +23,52 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
+def normalize_db_url(url: str) -> str:
+    """
+    Convert an asyncpg-style URL to a psycopg2-compatible one.
+
+    Mirrors scripts/enrich_new_repos.py:normalize_db_url — duplicated rather
+    than imported because scripts/ is not a package and both files run as
+    top-level entrypoints. Keep the two implementations in sync.
+
+    - Strip +asyncpg driver suffix
+    - Map asyncpg ssl=require query param to psycopg2 sslmode=require
+    """
+    import urllib.parse
+
+    url = url.replace("+asyncpg", "")
+    if url.startswith("postgresql+"):
+        url = "postgresql" + url[url.index("://"):]
+
+    parsed = urllib.parse.urlsplit(url)
+    params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+    ssl_val = params.pop("ssl", [None])[0]
+    if ssl_val and "sslmode" not in params:
+        if ssl_val.lower() in ("true", "1", "require"):
+            params["sslmode"] = ["require"]
+        elif ssl_val.lower() in ("false", "0", "disable"):
+            params["sslmode"] = ["disable"]
+
+    new_query = urllib.parse.urlencode(
+        {k: v[0] for k, v in params.items()}, safe=""
+    )
+    return urllib.parse.urlunsplit(parsed._replace(query=new_query))
+
+
 def get_db_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     if url:
-        return url
+        return normalize_db_url(url)
     try:
         from google.cloud import secretmanager
         client = secretmanager.SecretManagerServiceClient()
-        name = f"projects/perditio-platform/secrets/reporium-db-url/versions/latest"
+        # Use the async URL secret (same one the Cloud Run Job manifest provides
+        # via DATABASE_URL env). The previous "reporium-db-url" name was stale —
+        # only the async variant exists post-Cloud-SQL-migration.
+        name = "projects/perditio-platform/secrets/reporium-db-url-async/versions/latest"
         response = client.access_secret_version(request={"name": name})
-        return response.payload.data.decode("UTF-8").strip()
+        return normalize_db_url(response.payload.data.decode("UTF-8").strip())
     except Exception:
         pass
     raise RuntimeError("No DATABASE_URL found")
