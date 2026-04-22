@@ -63,10 +63,12 @@ done
 From repo root:
 
 ```bash
-gcloud builds submit \
-  --config cloudbuild-enrichment.yaml \
-  --substitutions=_IMAGE_TAG=latest
+gcloud builds submit --config cloudbuild-enrichment.yaml
 ```
+
+`cloudbuild-enrichment.yaml` hardcodes the image tag to `:latest` — no
+`--substitutions` flag is needed. Expected duration: ~6–8 min (sentence-transformers
+pulls ~2 GB of PyTorch on cold cache).
 
 ## 4. Deploy the Cloud Run Job
 
