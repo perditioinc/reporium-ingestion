@@ -300,6 +300,14 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
             else:
                 all_repos = await gh_client.get_repos(settings.gh_username)
 
+        # Hydrate forked_from via secondary fetch. The list endpoint returns
+        # the minimal-repository schema which omits `parent`, so forks come
+        # back with forked_from=None. Done after the fix_repos filter so a
+        # fix-mode run for 6 repos only makes ~6 extra API calls instead of
+        # one per fork in the entire account (~900, 7+ min at rate-limit).
+        with console.status('Hydrating fork parents...'):
+            await gh_client.hydrate_fork_parents(all_repos)
+
         api_calls_after_list = rate_limiter.calls_this_run
         console.print(f'Fetching repo list... [green]✓[/green]  {len(all_repos)} repos ({api_calls_after_list} API calls)')
 

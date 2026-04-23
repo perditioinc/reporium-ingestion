@@ -209,20 +209,27 @@ class GitHubClient:
                 break
             page += 1
 
-        # Hydrate forked_from for every fork. GET /users/{user}/repos returns
-        # the minimal-repository schema which does NOT include `parent`, so
-        # the `r['parent']['full_name']` branch above evaluates to None for
-        # every fork. That is the root cause of the 2026-04-23 regression
-        # where recently-added forks showed `perditioinc` as the only builder
-        # instead of the upstream owner. Secondary-fetch GET /repos/{owner}/{name}
-        # (full Repository schema) via get_fork_info() to populate it.
+        return repos
+
+    async def hydrate_fork_parents(self, repos: list[GitHubRepo]) -> None:
+        """
+        Hydrate `forked_from` for every fork in the list via secondary fetch.
+
+        GET /users/{user}/repos returns the minimal-repository schema which does
+        NOT include `parent`, so `forked_from` is always None for forks after
+        list pagination. Root cause of the 2026-04-23 regression where recently-
+        added forks showed `perditioinc` as the only builder instead of the
+        upstream owner.
+
+        Callers should filter `repos` to the subset they actually intend to
+        process BEFORE calling this — hydrating every fork in a 1800-repo
+        account adds ~900 API calls / 7+ min to every run. Mutates in place.
+        """
         for repo in repos:
             if repo.is_fork and repo.forked_from is None:
                 info = await self.get_fork_info(repo.owner, repo.name)
                 if info:
                     repo.forked_from = f'{info.upstream_owner}/{info.upstream_repo}'
-
-        return repos
 
     async def get_fork_info(self, owner: str, repo: str) -> ForkInfo | None:
         data = await self._request('GET', f'/repos/{owner}/{repo}')
