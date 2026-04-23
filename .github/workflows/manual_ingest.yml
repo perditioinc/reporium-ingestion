@@ -56,7 +56,11 @@ jobs:
 
           if [ -n "$FIX_REPOS" ]; then
             echo "Running fix mode for repos: $FIX_REPOS"
-            python -m ingestion run --mode fix --repos "$FIX_REPOS"
+            # NB: `fix` is its own CLI subcommand (main.py:506). The previous
+            # form `run --mode fix --repos ...` silently dropped --repos because
+            # the `run` branch only parses --mode, so every fix-mode dispatch
+            # was degenerating into a full 1852-repo scan and hanging.
+            python -m ingestion fix --repos "$FIX_REPOS"
           else
             echo "Running ingestion in $MODE mode for all repos"
             python -m ingestion run --mode "$MODE"
