@@ -507,10 +507,18 @@ def main() -> None:
         repos = []
         for i, arg in enumerate(args):
             if arg == '--repos':
-                repos = args[i + 1:]
+                # Accept either space-separated (`--repos a b c`) or
+                # comma-separated (`--repos "a,b,c"`). The workflow passes a
+                # single quoted CSV; interactive callers typically use spaces.
+                raw = args[i + 1:]
+                for token in raw:
+                    for name in token.split(','):
+                        name = name.strip()
+                        if name:
+                            repos.append(name)
                 break
         if not repos:
-            console.print('[red]Usage: python -m ingestion fix --repos repo1 repo2[/red]')
+            console.print('[red]Usage: python -m ingestion fix --repos repo1 repo2  (or --repos "repo1,repo2")[/red]')
             sys.exit(1)
         asyncio.run(run_ingestion(RunMode.QUICK, fix_repos=repos))
 
