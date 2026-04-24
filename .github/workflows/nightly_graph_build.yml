@@ -24,6 +24,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Execute Cloud Run Job (build edges)
+        id: graph_job
         run: |
           echo "Triggering reporium-graph-build Cloud Run Job..."
           gcloud run jobs execute reporium-graph-build \
@@ -31,6 +32,50 @@ jobs:
             --region=us-central1 \
             --wait
           echo "Cloud Run Job completed successfully"
+
+      - name: Surface Cloud Run Job diagnostics on failure
+        if: failure() && steps.graph_job.outcome == 'failure'
+        run: |
+          echo "::group::Recent reporium-graph-build executions"
+          gcloud run jobs executions list \
+            --job=reporium-graph-build \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --limit=3 \
+            --format='table(metadata.name,status.startTime,status.completionTime,status.conditions[0].type,status.conditions[0].message)' || true
+          echo "::endgroup::"
+
+          LATEST=$(gcloud run jobs executions list \
+            --job=reporium-graph-build \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --limit=1 \
+            --format='value(metadata.name)' 2>/dev/null || true)
+          if [ -n "$LATEST" ]; then
+            echo "::group::Execution detail: $LATEST"
+            gcloud run jobs executions describe "$LATEST" \
+              --project=perditio-platform \
+              --region=us-central1 \
+              --format=yaml || true
+            echo "::endgroup::"
+
+            echo "::group::Last 200 log lines for $LATEST"
+            gcloud logging read \
+              "resource.type=cloud_run_job AND resource.labels.job_name=reporium-graph-build AND labels.\"run.googleapis.com/execution_name\"=$LATEST" \
+              --project=perditio-platform \
+              --limit=200 \
+              --format='value(timestamp,severity,textPayload)' \
+              --order=asc || true
+            echo "::endgroup::"
+          else
+            echo "::warning::Could not resolve latest execution name; showing recent job logs"
+            gcloud logging read \
+              "resource.type=cloud_run_job AND resource.labels.job_name=reporium-graph-build" \
+              --project=perditio-platform \
+              --limit=200 \
+              --format='value(timestamp,severity,textPayload)' \
+              --order=asc || true
+          fi
 
       - name: Trigger graph snapshot rebuild via reporium-api admin endpoint
         env:
