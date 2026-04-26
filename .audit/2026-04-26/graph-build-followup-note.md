@@ -94,7 +94,7 @@ This lane created **no new** scheduled tasks — the existing two cover the next
 
 **Anchor:** 2026-04-25 20:15 PDT (autonomous lane shift, ~25 min after the +3h scheduled drift sweep at 20:05 PDT).
 **Disposition (still):** **BLOCKED OUTSIDE REPO** on the same two GCP-side issues. The carried-forward RCA (`reporium-db-url` Secret Manager rotation drift) is unchanged.
-**Disposition (new):** **REPO-LOCAL DIAGNOSTIC IMPROVEMENT SHIPPED** as a small workflow patch — see PR opened from `claude/feature/KAN-DRAFT-graph-build-followup`.
+**Disposition (new):** **REPO-LOCAL DIAGNOSTIC IMPROVEMENT SHIPPED** as PR [#68](https://github.com/perditioinc/reporium-ingestion/pull/68) (branch `claude/feature/KAN-DRAFT-graph-build-followup`, base `main`, mergeStateStatus=MERGEABLE/UNSTABLE while Tests run).
 
 ### Live state at this anchor (re-validated)
 
