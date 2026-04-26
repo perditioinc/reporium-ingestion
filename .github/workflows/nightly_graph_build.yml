@@ -77,6 +77,38 @@ jobs:
               --order=asc || true
           fi
 
+      - name: Check Secret Manager rotation drift (inline RCA hint)
+        if: failure() && steps.graph_job.outcome == 'failure'
+        run: |
+          # Targets the carried-forward RCA: post-2026-04-22 Cloud SQL postgres
+          # password rotation drift between reporium-db-url and reporium-db-url-async.
+          # Works without roles/logging.viewer; needs roles/secretmanager.viewer.
+          # If the CI SA also lacks that, the step surfaces it as a second IAM gap.
+          echo "::group::Secret Manager rotation comparison"
+          MAIN_OUT=$(gcloud secrets versions list reporium-db-url \
+            --project=perditio-platform \
+            --filter='state=ENABLED' \
+            --sort-by=~createTime --limit=1 \
+            --format='value(createTime)' 2>&1) || true
+          ASYNC_OUT=$(gcloud secrets versions list reporium-db-url-async \
+            --project=perditio-platform \
+            --filter='state=ENABLED' \
+            --sort-by=~createTime --limit=1 \
+            --format='value(createTime)' 2>&1) || true
+          echo "reporium-db-url       latest enabled createTime: ${MAIN_OUT:-(no output)}"
+          echo "reporium-db-url-async latest enabled createTime: ${ASYNC_OUT:-(no output)}"
+          RUNBOOK="https://github.com/perditioinc/reporium-ingestion/blob/main/.audit/2026-04-26/graph-build-followup-jira.md"
+          if printf '%s\n%s\n' "$MAIN_OUT" "$ASYNC_OUT" | grep -qiE 'permission_denied|forbidden'; then
+            echo "::warning::Secret Manager metadata read denied for CI SA. To enable inline rotation-drift detection, grant roles/secretmanager.viewer to reporium-ingestion-ci@perditio-platform.iam.gserviceaccount.com. See runbook: ${RUNBOOK}"
+          elif [ -n "$MAIN_OUT" ] && [ -n "$ASYNC_OUT" ] && [ "$ASYNC_OUT" \> "$MAIN_OUT" ]; then
+            echo "::error::SECRET ROTATION DRIFT DETECTED — reporium-db-url-async (${ASYNC_OUT}) is newer than reporium-db-url (${MAIN_OUT}). Most likely root cause: graph-build secret was not rotated after the Cloud SQL postgres password change. Operator runbook: ${RUNBOOK}"
+          elif [ -n "$MAIN_OUT" ] && [ -n "$ASYNC_OUT" ]; then
+            echo "::notice::Secret rotation drift NOT confirmed by metadata comparison (reporium-db-url is at least as recent as reporium-db-url-async). Cause may be different — see runbook: ${RUNBOOK}"
+          else
+            echo "::warning::Secret Manager metadata comparison inconclusive (empty output). See runbook: ${RUNBOOK}"
+          fi
+          echo "::endgroup::"
+
       - name: Trigger graph snapshot rebuild via reporium-api admin endpoint
         env:
           ADMIN_API_KEY: ${{ secrets.REPORIUM_ADMIN_API_KEY }}
