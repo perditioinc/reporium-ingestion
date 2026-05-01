@@ -27,7 +27,10 @@ import sys
 import time
 
 import httpx
-import psycopg2
+
+# psycopg2 is imported lazily inside get_db_url() / main() so the fetcher
+# function and its tests can be exercised without the (heavy, native-binary)
+# DB driver installed. CI installs only the minimum needed to run unit tests.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -170,6 +173,8 @@ def get_db_url() -> str:
 
 
 def main():
+    import psycopg2  # Lazy import — keeps fetcher unit-testable without DB driver.
+
     token = os.getenv("GH_TOKEN", "").strip()
     if not token:
         print("ERROR: GH_TOKEN required")
