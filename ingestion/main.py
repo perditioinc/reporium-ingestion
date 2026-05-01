@@ -174,6 +174,17 @@ async def _to_api_payload(
         'github_updated_at': repo.updated_at,
         'your_last_push_at': repo.pushed_at,
         'upstream_last_push_at': fetched.upstream_last_push_at,
+        # KAN-DRAFT-trends-payload-timestamps: github_created_at and forked_at
+        # were silently omitted, leaving both columns blank in the DB. The
+        # /trends "New This Week" panel filters on `github_created_at > NOW() -
+        # INTERVAL '7 days'` and so showed an empty list even though the daily
+        # Cloud Run Job WAS topping the corpus up. GitHub does not expose a
+        # separate "forked_at" timestamp — the convention is forked_at == the
+        # fork's own created_at. For non-forks, forked_at is meaningless, so
+        # we send None (the API schema accepts `datetime | None`, the DB
+        # stores NULL — never the empty string the frontend was choking on).
+        'github_created_at': repo.created_at,
+        'forked_at': repo.created_at if repo.is_fork else None,
         'readme_summary': summary,
         'activity_score': min(100, (
             # Commit velocity (up to 60 pts): 30d commits × 3 + 7d commits × 5
