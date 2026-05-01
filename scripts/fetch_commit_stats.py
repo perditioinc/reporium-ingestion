@@ -6,6 +6,16 @@ Updates commits_last_7_days, commits_last_30_days, commits_last_90_days on repos
 Cost: $0 — GitHub API only.
 Rate limit: 500ms delay between requests, stops if remaining < 100.
 
+202 handling: GitHub returns 202 Accepted with an empty body while it computes
+stats asynchronously, then 200 with data on a subsequent request. We retry up
+to 3 attempts total (first call + 2 retries) with a 2s sleep between, then give
+up and return None. A None return signals "unavailable" — the caller MUST NOT
+overwrite the existing commits_last_*_days columns (preserving last good values
+rather than overwriting with zeros). Without this retry, repos that hit 202 on
+first attempt are silently skipped and their commit-stats columns stay at the
+default 0 forever — that was the root cause of universal `last7Days = 0` on
+the live /trends page (KAN-DRAFT-trends-202-retry, 2026-04-30).
+
 Usage:
     GH_TOKEN=... DATABASE_URL=... python scripts/fetch_commit_stats.py
 """
@@ -17,10 +27,98 @@ import sys
 import time
 
 import httpx
-import psycopg2
+
+# psycopg2 is imported lazily inside get_db_url() / main() so the fetcher
+# function and its tests can be exercised without the (heavy, native-binary)
+# DB driver installed. CI installs only the minimum needed to run unit tests.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+
+# Retry policy for `/stats/commit_activity` — see module docstring for rationale.
+COMMIT_ACTIVITY_MAX_ATTEMPTS = 3
+COMMIT_ACTIVITY_RETRY_SLEEP_S = 2.0
+
+
+def fetch_commit_activity(
+    client: httpx.Client,
+    target: str,
+    headers: dict,
+    max_attempts: int = COMMIT_ACTIVITY_MAX_ATTEMPTS,
+    retry_sleep: float = COMMIT_ACTIVITY_RETRY_SLEEP_S,
+):
+    """
+    Fetch /stats/commit_activity with 202-retry.
+
+    Returns:
+        list[dict]: weeks payload on a 200 (may be empty for brand-new repos).
+        None:      stats unavailable — caller MUST NOT overwrite stored columns.
+                   This covers (a) max_attempts consecutive 202s, (b) 4xx/5xx
+                   responses other than 200, (c) malformed JSON.
+
+    Side effect: sets `client._last_rate_limit_remaining` to the most recent
+    `x-ratelimit-remaining` header value seen (or None if unparseable). Callers
+    can read this for budget enforcement without making an extra request.
+
+    The signature accepts an injected `httpx.Client` for testability.
+    """
+    url = f"https://api.github.com/repos/{target}/stats/commit_activity"
+    last_status: int | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        resp = client.get(url, headers=headers)
+        last_status = resp.status_code
+
+        # Stash rate-limit info so caller can early-abort on budget exhaustion.
+        try:
+            setattr(
+                client,
+                "_last_rate_limit_remaining",
+                int(resp.headers.get("x-ratelimit-remaining", 999)),
+            )
+        except (ValueError, TypeError):
+            setattr(client, "_last_rate_limit_remaining", None)
+
+        if resp.status_code == 200:
+            try:
+                body = resp.json()
+            except (ValueError, json.JSONDecodeError):
+                logger.warning(
+                    "Malformed JSON from /stats/commit_activity for %s — skipping",
+                    target,
+                )
+                return None
+            return body if isinstance(body, list) else None
+
+        if resp.status_code == 202:
+            if attempt < max_attempts:
+                logger.info(
+                    "202 Accepted on /stats/commit_activity for %s (attempt %d/%d) — "
+                    "GitHub is still computing, retrying in %.1fs",
+                    target, attempt, max_attempts, retry_sleep,
+                )
+                if retry_sleep > 0:
+                    time.sleep(retry_sleep)
+                continue
+            # Out of retries on 202 — stats genuinely unavailable right now.
+            logger.warning(
+                "Persistent 202 on /stats/commit_activity for %s after %d attempts — "
+                "preserving existing commits_last_*_days columns (no overwrite)",
+                target, max_attempts,
+            )
+            return None
+
+        # Any other status (404, 5xx, …) — caller should not overwrite.
+        return None
+
+    # Defensive: loop should have returned. Treat as unavailable.
+    logger.warning(
+        "Exited /stats/commit_activity retry loop without a result for %s "
+        "(last status: %s)",
+        target, last_status,
+    )
+    return None
 
 
 def normalize_db_url(url: str) -> str:
@@ -75,6 +173,8 @@ def get_db_url() -> str:
 
 
 def main():
+    import psycopg2  # Lazy import — keeps fetcher unit-testable without DB driver.
+
     token = os.getenv("GH_TOKEN", "").strip()
     if not token:
         print("ERROR: GH_TOKEN required")
@@ -109,28 +209,28 @@ def main():
             target = forked_from or f"{owner}/{name}"
 
             try:
-                resp = client.get(
-                    f"https://api.github.com/repos/{target}/stats/commit_activity",
-                    headers=headers,
-                )
+                weeks = fetch_commit_activity(client, target, headers)
 
-                # Check rate limit
-                remaining = int(resp.headers.get("x-ratelimit-remaining", 999))
-                if remaining < 100:
-                    logger.warning(f"Rate limit low ({remaining}), stopping early")
+                # Rate-limit check using the headers stashed by the fetcher —
+                # avoids an extra `/rate_limit` round-trip. If we burned through
+                # the budget (e.g. retries on many repos), stop the run early
+                # rather than triggering 403 secondary-rate-limit penalties.
+                remaining = getattr(client, "_last_rate_limit_remaining", None)
+                if remaining is not None and remaining < 100:
+                    logger.warning(
+                        "Rate limit low (%s remaining), stopping early", remaining
+                    )
                     break
 
-                if resp.status_code == 202:
-                    # GitHub is computing stats, skip for now
+                if weeks is None:
+                    # Either persistent 202 or non-200/404/etc.
+                    # Deliberately do NOT update the row — preserves existing
+                    # commits_last_*_days values rather than overwriting with 0.
                     skipped += 1
                     continue
 
-                if resp.status_code != 200:
-                    skipped += 1
-                    continue
-
-                weeks = resp.json()
-                if not isinstance(weeks, list) or len(weeks) == 0:
+                if len(weeks) == 0:
+                    # Brand-new repo with no week data yet. Same skip semantics.
                     skipped += 1
                     continue
 
