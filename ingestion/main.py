@@ -315,14 +315,19 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                 repo_names=[p['name'] for p in payloads],
             )
 
-        # Post trend snapshot and gap analysis on weekly/full runs
-        if mode in (RunMode.WEEKLY, RunMode.FULL):
-            with console.status('Computing trends & gaps...'):
-                snapshot = build_trend_snapshot(payloads)
-                gaps = detect_gaps(snapshot)
-                await api_client.post_trend_snapshot(snapshot)
-                await api_client.post_gap_analysis(gaps)
-            console.print(f'Trends & gaps: [green]✓[/green]  {len(gaps)} gaps detected')
+        # Post trend snapshot and gap analysis on every successful run.
+        #
+        # Previously gated to WEEKLY|FULL only, which left /trends/report empty
+        # in production: the daily Cloud Run Job runs in QUICK mode (see
+        # deploy/job.yaml), and the weekly GHA path was the only writer.
+        # Each snapshot is timestamped (captured_at = now()) so multiple
+        # snapshots per day are fine — they're a time series, not an upsert.
+        with console.status('Computing trends & gaps...'):
+            snapshot = build_trend_snapshot(payloads)
+            gaps = detect_gaps(snapshot)
+            await api_client.post_trend_snapshot(snapshot)
+            await api_client.post_gap_analysis(gaps)
+        console.print(f'Trends & gaps: [green]✓[/green]  {len(gaps)} gaps detected')
 
     elapsed = time.time() - start_time
     total_api_calls = rate_limiter.calls_this_run

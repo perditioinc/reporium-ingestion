@@ -13,8 +13,8 @@ venv/
 *.db
 data/
 
-# Cache
-cache/
+# Cache (top-level runtime cache dir only — NOT ingestion/cache/ source pkg)
+/cache/
 .pytest_cache/
 
 # Build
