@@ -75,5 +75,5 @@ jobs:
           alembic upgrade head
 
       - name: Run integration tests
-        run: pytest tests/test_knowledge_graph.py -v
+        run: pytest tests/test_knowledge_graph.py tests/test_build_extends.py -v
         timeout-minutes: 5

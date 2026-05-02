@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 500
 
 # Edge types managed by this builder (others like MAINTAINED_BY are preserved)
-MANAGED_TYPES = ("COMPATIBLE_WITH", "ALTERNATIVE_TO", "DEPENDS_ON")
+MANAGED_TYPES = ("COMPATIBLE_WITH", "ALTERNATIVE_TO", "DEPENDS_ON", "EXTENDS")
 
 
 # ── staging table ops ────────────────────────────────────────────────────────
@@ -175,6 +175,7 @@ def build_and_swap(db_url: str, run_id: int, run_manager: IngestRunManager) -> d
         build_compatible_with,
         build_alternative_to,
         build_depends_on,
+        build_extends,
         verify_table,
     )
 
@@ -196,11 +197,13 @@ def build_and_swap(db_url: str, run_id: int, run_manager: IngestRunManager) -> d
         compatible_edges = build_compatible_with(cur)
         alternative_edges = build_alternative_to(cur)
         depends_edges = build_depends_on(cur)
+        extends_edges = build_extends(cur)
 
         new_counts = {
             "COMPATIBLE_WITH": len(compatible_edges),
             "ALTERNATIVE_TO": len(alternative_edges),
             "DEPENDS_ON": len(depends_edges),
+            "EXTENDS": len(extends_edges),
         }
         logger.info("New edge counts: %s", new_counts)
 
@@ -218,7 +221,8 @@ def build_and_swap(db_url: str, run_id: int, run_manager: IngestRunManager) -> d
         s1 = _insert_into_staging(cur, compatible_edges, "COMPATIBLE_WITH")
         s2 = _insert_into_staging(cur, alternative_edges, "ALTERNATIVE_TO")
         s3 = _insert_into_staging(cur, depends_edges, "DEPENDS_ON")
-        logger.info("Staged %d edges total", s1 + s2 + s3)
+        s4 = _insert_into_staging(cur, extends_edges, "EXTENDS")
+        logger.info("Staged %d edges total", s1 + s2 + s3 + s4)
 
         # Checkpoint: staged, about to swap
         run_manager.save_checkpoint(run_id, {
@@ -238,6 +242,7 @@ def build_and_swap(db_url: str, run_id: int, run_manager: IngestRunManager) -> d
             "COMPATIBLE_WITH": s1,
             "ALTERNATIVE_TO": s2,
             "DEPENDS_ON": s3,
+            "EXTENDS": s4,
         }
 
         # Print examples for operator visibility
@@ -245,6 +250,7 @@ def build_and_swap(db_url: str, run_id: int, run_manager: IngestRunManager) -> d
             ("COMPATIBLE_WITH", compatible_edges),
             ("ALTERNATIVE_TO", alternative_edges),
             ("DEPENDS_ON", depends_edges),
+            ("EXTENDS", extends_edges),
         ]:
             if edges_list:
                 print(f"\nEXAMPLE {label} EDGES:")
