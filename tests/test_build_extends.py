@@ -33,11 +33,16 @@ class TestBuildExtends:
     """Validates the fork_resolution predicate as a builder."""
 
     def test_resolvable_fork(self, db_conn):
-        """is_fork=true + forked_from resolves to a tracked repo → 1 edge."""
+        """is_fork=true + forked_from resolves to a tracked repo → 1 edge.
+
+        The production schema has UNIQUE(name), so upstream and fork must
+        use distinct names. The fork_resolution predicate keys on
+        f"{owner}/{name}" — name uniqueness doesn't compromise the test.
+        """
         cur = db_conn.cursor()
-        upstream = make_repo(cur, name="parent-lib", owner="upstream-org")
-        fork = make_repo(cur, name="parent-lib", owner="fork-org")
-        _mark_fork(cur, fork, forked_from="upstream-org/parent-lib")
+        upstream = make_repo(cur, name="extends-parent-lib", owner="upstream-org")
+        fork = make_repo(cur, name="extends-parent-lib-fork", owner="fork-org")
+        _mark_fork(cur, fork, forked_from="upstream-org/extends-parent-lib")
         db_conn.commit()
 
         edges = build_extends(cur)
@@ -49,12 +54,12 @@ class TestBuildExtends:
         assert edge["confidence"] == 0.95
         assert edge["weight"] == 1.0
         assert edge["evidence"]["method"] == "fork_resolution"
-        assert edge["evidence"]["forked_from"] == "upstream-org/parent-lib"
+        assert edge["evidence"]["forked_from"] == "upstream-org/extends-parent-lib"
 
     def test_unresolvable_fork(self, db_conn):
         """is_fork=true but forked_from points outside the tracked set → 0 edges."""
         cur = db_conn.cursor()
-        fork = make_repo(cur, name="ghost-fork", owner="fork-org")
+        fork = make_repo(cur, name="extends-ghost-fork", owner="fork-org")
         _mark_fork(cur, fork, forked_from="some-other-org/never-ingested")
         db_conn.commit()
 
@@ -65,12 +70,12 @@ class TestBuildExtends:
         """is_fork=false → 0 edges, even if forked_from happens to be set."""
         cur = db_conn.cursor()
         # Two real repos
-        parent = make_repo(cur, name="real-parent", owner="org")
+        parent = make_repo(cur, name="extends-real-parent", owner="org")
         # A repo with is_fork=false that should never produce an edge
-        bystander = make_repo(cur, name="standalone", owner="org")
+        bystander = make_repo(cur, name="extends-standalone", owner="org")
         # Defensive: even if a stray forked_from string was set, is_fork governs.
         cur.execute(
-            "UPDATE repos SET forked_from = 'org/real-parent' WHERE id = %s",
+            "UPDATE repos SET forked_from = 'org/extends-real-parent' WHERE id = %s",
             (bystander,),
         )
         db_conn.commit()
@@ -81,37 +86,41 @@ class TestBuildExtends:
     def test_self_reference(self, db_conn):
         """is_fork=true and forked_from resolves to itself → 0 edges (filtered)."""
         cur = db_conn.cursor()
-        repo_id = make_repo(cur, name="self-fork", owner="org")
-        # Point forked_from at itself: "org/self-fork" → resolves to repo_id
-        _mark_fork(cur, repo_id, forked_from="org/self-fork")
+        repo_id = make_repo(cur, name="extends-self-fork", owner="org")
+        # Point forked_from at itself: "org/extends-self-fork" → resolves to repo_id
+        _mark_fork(cur, repo_id, forked_from="org/extends-self-fork")
         db_conn.commit()
 
         edges = build_extends(cur)
         assert edges == []
 
     def test_multiple_forks_partial_resolution(self, db_conn):
-        """5 forks, 3 with resolvable upstreams → 3 edges."""
+        """5 forks, 3 with resolvable upstreams → 3 edges.
+
+        Production schema enforces UNIQUE(name) — every test row gets a
+        distinct name; the predicate keys on f"{owner}/{name}".
+        """
         cur = db_conn.cursor()
 
         # 3 upstream repos that exist in our DB
-        u1 = make_repo(cur, name="lib-one", owner="upstream")
-        u2 = make_repo(cur, name="lib-two", owner="upstream")
-        u3 = make_repo(cur, name="lib-three", owner="upstream")
+        u1 = make_repo(cur, name="extends-multi-lib-one", owner="upstream")
+        u2 = make_repo(cur, name="extends-multi-lib-two", owner="upstream")
+        u3 = make_repo(cur, name="extends-multi-lib-three", owner="upstream")
 
-        # 5 forks, 3 resolvable, 2 unresolvable
-        f1 = make_repo(cur, name="lib-one", owner="forker-a")
-        _mark_fork(cur, f1, forked_from="upstream/lib-one")
+        # 5 forks, 3 resolvable, 2 unresolvable. Distinct names per row.
+        f1 = make_repo(cur, name="extends-multi-fork-one", owner="forker-a")
+        _mark_fork(cur, f1, forked_from="upstream/extends-multi-lib-one")
 
-        f2 = make_repo(cur, name="lib-two", owner="forker-b")
-        _mark_fork(cur, f2, forked_from="upstream/lib-two")
+        f2 = make_repo(cur, name="extends-multi-fork-two", owner="forker-b")
+        _mark_fork(cur, f2, forked_from="upstream/extends-multi-lib-two")
 
-        f3 = make_repo(cur, name="lib-three", owner="forker-c")
-        _mark_fork(cur, f3, forked_from="upstream/lib-three")
+        f3 = make_repo(cur, name="extends-multi-fork-three", owner="forker-c")
+        _mark_fork(cur, f3, forked_from="upstream/extends-multi-lib-three")
 
-        f4 = make_repo(cur, name="lib-missing", owner="forker-d")
+        f4 = make_repo(cur, name="extends-multi-fork-four", owner="forker-d")
         _mark_fork(cur, f4, forked_from="not-tracked/lib-missing")
 
-        f5 = make_repo(cur, name="lib-other", owner="forker-e")
+        f5 = make_repo(cur, name="extends-multi-fork-five", owner="forker-e")
         _mark_fork(cur, f5, forked_from="also-not-tracked/lib-other")
 
         db_conn.commit()
