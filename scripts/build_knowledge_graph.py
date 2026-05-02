@@ -392,6 +392,77 @@ def build_depends_on(cur):
     return edges
 
 
+def build_extends(cur):
+    """
+    Create EXTENDS edges from repo fork relationships.
+
+    A repo extends another iff:
+      - is_fork = TRUE
+      - forked_from (a "owner/name" string) resolves to a repo we track
+      - source != target (no self-reference)
+
+    Confidence = 0.95 (deterministic, from GitHub fork metadata).
+
+    Mirrors the validity predicate at
+    reporium-api/app/routers/platform.py:386-398 (used by
+    /metrics/graph-quality precision_proxy). Closes the structural gap
+    that left the EXTENDS metric flat-zero — the predicate existed but
+    no builder did.
+    """
+    logger.info("Building EXTENDS edges...")
+
+    cur.execute("SELECT id, owner, name, is_fork, forked_from FROM repos;")
+    rows = cur.fetchall()
+
+    full_name_index = {}
+    repo_info = {}
+    for row in rows:
+        repo_id, owner, name, is_fork, forked_from = row
+        full_name_index[f"{owner}/{name}"] = str(repo_id)
+        repo_info[str(repo_id)] = {
+            "id": repo_id,
+            "owner": owner,
+            "name": name,
+            "is_fork": is_fork,
+            "forked_from": forked_from,
+        }
+
+    logger.info(f"  Repo full-name index size: {len(full_name_index)}")
+
+    edges = []
+    seen = set()
+    for r in repo_info.values():
+        if not r["is_fork"] or not r["forked_from"]:
+            continue
+        target_id = full_name_index.get(r["forked_from"])
+        if not target_id:
+            continue
+        source_id = str(r["id"])
+        if target_id == source_id:
+            continue  # Skip self-reference
+        pair_key = (source_id, target_id)
+        if pair_key in seen:
+            continue
+        seen.add(pair_key)
+
+        target = repo_info.get(target_id, {})
+        edges.append({
+            "source": r["id"],
+            "target": target.get("id", target_id),
+            "weight": 1.0,
+            "confidence": 0.95,
+            "evidence": {
+                "forked_from": r["forked_from"],
+                "method": "fork_resolution",
+            },
+            "source_name": f"{r['owner']}/{r['name']}",
+            "target_name": r["forked_from"],
+        })
+
+    logger.info(f"  EXTENDS edges (fork resolution): {len(edges)}")
+    return edges
+
+
 # ---------------------------------------------------------------------------
 # Edge insertion
 # ---------------------------------------------------------------------------
