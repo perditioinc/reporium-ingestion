@@ -4,6 +4,14 @@ name: Nightly Enrichment Quality Probe
 # zero gate on what the nightly Anthropic enrichment writes into
 # repos.primary_category / repos.integration_tags / repos.readme_summary.
 #
+# KAN-192 — re-wires the probe to call the reporium-api admin endpoint
+# /admin/enrichment/quality-probe instead of running the Python module
+# directly. Why: the original direct-DB approach failed in GitHub Actions
+# because DATABASE_URL points at a Cloud SQL Unix socket only mounted in
+# GCP runtimes. The admin endpoint runs in-VPC where DATABASE_URL works,
+# mirroring the established /admin/graph/rebuild-snapshot pattern used by
+# nightly_graph_build.yml.
+#
 # The Cloud Run Job `reporium-ingestion-nightly` runs at 03:00 UTC (see
 # deploy/scheduler.yaml) and typically finishes within ~60 min.
 # This workflow runs at 05:00 UTC — well after enrichment completes,
@@ -16,16 +24,7 @@ name: Nightly Enrichment Quality Probe
 on:
   schedule:
     - cron: "0 5 * * *"
-  workflow_dispatch:
-    inputs:
-      sample_size:
-        description: "Sample size override (default 20)"
-        required: false
-        default: ""
-      total_enriched_floor:
-        description: "Total enriched corpus floor override (default 1500)"
-        required: false
-        default: ""
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -33,34 +32,50 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Enrichment quality probe
+      - name: Run enrichment quality probe via admin endpoint
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          PROBE_SAMPLE_SIZE: ${{ inputs.sample_size }}
-          PROBE_TOTAL_ENRICHED_FLOOR: ${{ inputs.total_enriched_floor }}
-          PROBE_REPORT_DIR: ${{ github.workspace }}/quality_probe_reports
-        run: python -m ingestion.enrichment.quality_probe
-
-      - name: Surface report on failure
-        if: failure()
+          API_URL: ${{ secrets.REPORIUM_API_URL }}
+          ADMIN_API_KEY: ${{ secrets.REPORIUM_ADMIN_API_KEY }}
         run: |
-          echo "::group::Latest probe report"
-          ls -la quality_probe_reports/ || true
-          for f in quality_probe_reports/*.md; do
-            echo "::group::$f"
-            cat "$f"
-            echo "::endgroup::"
-          done
+          set -o pipefail
+          if [ -z "${API_URL}" ]; then
+            echo "::error::REPORIUM_API_URL secret is not set"
+            exit 1
+          fi
+          if [ -z "${ADMIN_API_KEY}" ]; then
+            echo "::error::REPORIUM_ADMIN_API_KEY secret is not set"
+            exit 1
+          fi
+
+          response=$(curl -sS -X POST "${API_URL}/admin/enrichment/quality-probe" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Length: 0" \
+            -w "\n%{http_code}" \
+            --max-time 120)
+          body=$(echo "$response" | sed '$d')
+          code=$(echo "$response" | tail -n1)
+
+          echo "::group::Probe response (HTTP $code)"
+          echo "$body" | jq . || echo "$body"
           echo "::endgroup::"
+
+          # 200 = all checks passed; 422 = at least one check failed
+          # (body still contains the full report under .detail).
+          # Any other code is an unexpected failure (network, auth, 5xx).
+          if [ "$code" = "200" ]; then
+            echo "Probe PASSED"
+            exit 0
+          fi
+
+          if [ "$code" = "422" ]; then
+            echo "::error::Enrichment quality probe FAILED — see report above"
+            # Surface the per-check failures inline for fast triage.
+            echo "$body" | jq -r '.detail.checks[] | select(.passed == false) | "::error::\(.name): \(.observed) — floor: \(.floor)"' || true
+            exit 1
+          fi
+
+          echo "::error::Probe call returned unexpected HTTP $code"
+          exit 1
