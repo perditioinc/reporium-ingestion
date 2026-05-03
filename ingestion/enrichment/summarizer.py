@@ -1,5 +1,22 @@
+import os
+
 import httpx
+
 from ..config import get_settings
+
+
+def _fallback_min_chars() -> int:
+    """
+    Fallback summary floor — must match the KAN-191 probe's
+    `PROBE_SUMMARY_MIN_CHARS` (default 50). Reading the same env var here
+    keeps writer and reader on a single source of truth, so a future bump of
+    the probe floor automatically tightens what fallbacks we emit. KAN-200.
+    """
+    raw = os.getenv("PROBE_SUMMARY_MIN_CHARS", "50")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 50
 
 
 class RepoSummarizer:
@@ -57,12 +74,24 @@ class RepoSummarizer:
             return self._fallback_summary(readme)
 
     def _fallback_summary(self, readme: str | None) -> str | None:
+        """
+        First substantive paragraph of the README, capped at 500 chars.
+
+        KAN-200: floor aligned with the KAN-191 probe (default 50 chars). The
+        old `> 30` threshold produced strings the probe rejected as too_short
+        — caller-side regression where 4 of 20 sample repos failed the
+        probe's summary-length check (KAN-196 RCA F3). We now mirror the
+        probe's `PROBE_SUMMARY_MIN_CHARS` env var; if no paragraph clears the
+        floor we return `None` rather than write a too-short summary that
+        will fail the next probe.
+        """
         if not readme:
             return None
-        # Return first non-empty paragraph
+        min_chars = _fallback_min_chars()
+        # Return first non-empty paragraph that meets the probe's floor
         for para in readme.split('\n\n'):
             cleaned = para.strip().lstrip('#').strip()
             # Skip lines that are just images, badges, or headings
-            if cleaned and not cleaned.startswith('!') and len(cleaned) > 30:
+            if cleaned and not cleaned.startswith('!') and len(cleaned) >= min_chars:
                 return cleaned[:500]
         return None

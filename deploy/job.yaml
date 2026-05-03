@@ -48,3 +48,10 @@ spec:
                     secretKeyRef:
                       name: INGEST_API_KEY
                       key: latest
+                # KAN-200: keep the README fallback summarizer's floor in
+                # lock-step with the KAN-191 probe's PROBE_SUMMARY_MIN_CHARS.
+                # Override here ONLY if you are also overriding the probe
+                # config in reporium-api — otherwise leave unset and both
+                # sides will default to 50.
+                - name: PROBE_SUMMARY_MIN_CHARS
+                  value: "50"
