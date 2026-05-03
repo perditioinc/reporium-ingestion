@@ -37,6 +37,12 @@ from .enrichment.taxonomy import (
     assign_dimension, build_builder, PM_SKILLS,
 )
 from .enrichment.summarizer import RepoSummarizer
+from .enrichers.ai_enricher import (
+    ENRICHMENT_PROMPT,
+    _build_repo_context,
+    _parse_enrichment_response,
+    run_ai_enrichment,
+)
 from .api.client import ReporiumAPIClient
 from .analysis.trends import build_trend_snapshot
 from .analysis.gaps import detect_gaps
@@ -268,6 +274,157 @@ async def _to_api_payload(
     }
 
 
+# ── KAN-199: AI enrichment for ingest payloads ───────────────────────────────
+#
+# Wires the AI enricher into `python -m ingestion run` (the nightly Cloud Run
+# Job entry point). KAN-191's quality probe surfaced the regression: every
+# nightly since PR #64 cutover shipped empty `integration_tags` because the
+# tagger pass hard-codes `[]` for AI-populated fields and `ingestion.main`
+# never invoked the enricher. See
+# `.audit/2026-05-03-12h-run/enrichment-regression-rca.md` (KAN-196).
+#
+# We invoke ai_enricher.run_ai_enrichment() AFTER the API post for any
+# already-existing repos with NULL readme_summary. For the just-upserted
+# repos (whose AI fields would otherwise stay default in the payload), we
+# also run a per-payload Claude pass BEFORE the API post and merge the
+# result into the payload — that way `integration_tags`, `skill_areas`,
+# `industries`, `use_cases`, `modalities`, `ai_trends`, `deployment_context`,
+# `quality_assessment`, `maturity_level` flow through the existing
+# /ingest/repos endpoint (the same API path the tagger uses), instead of
+# direct-DB UPDATEs that target columns the live schema doesn't have
+# (`quality_assessment`, `maturity_level`, etc. are stored in junction
+# tables / `repo_taxonomy`, not as columns on `repos`).
+#
+# Errors from Claude or the parser are logged and the run continues —
+# enrichment failure must NOT abort the ingestion run (per KAN-199 design
+# constraint). Per-repo failure leaves the payload's empty AI fields in
+# place; the next nightly will retry that repo.
+
+
+def _merge_ai_fields_into_payload(payload: dict, ai_data: dict) -> None:
+    """Merge parsed Claude output into a tagger-built API payload.
+
+    Only non-empty AI fields overwrite. The API's `_upsert_repo` skip-empty
+    guard means this is safe even if Claude returned partial fields.
+    """
+    if ai_data.get("readme_summary"):
+        # Prefer AI summary over the local fallback summary, which often
+        # falls below the probe's 50-char floor (per KAN-196 RCA §2).
+        payload["readme_summary"] = ai_data["readme_summary"]
+    for field in (
+        "integration_tags",
+        "skill_areas",
+        "industries",
+        "use_cases",
+        "modalities",
+        "ai_trends",
+        "deployment_context",
+    ):
+        val = ai_data.get(field)
+        if val:
+            payload[field] = val
+    if ai_data.get("quality_assessment") is not None:
+        payload["quality_assessment"] = ai_data["quality_assessment"]
+    if ai_data.get("maturity_level") is not None:
+        payload["maturity_level"] = ai_data["maturity_level"]
+
+
+async def _enrich_payloads_with_ai(
+    payloads: list[dict],
+    *,
+    api_key: str,
+    model: str,
+) -> dict:
+    """For every just-built payload, call Claude and merge AI fields back in.
+
+    Mutates `payloads` in place. Returns a stats dict for logging.
+
+    Uses the same prompt + parser as `ingestion.enrichers.ai_enricher` so
+    output shape is identical to the `run_ai_enrichment` direct-DB path.
+    Anthropic SDK calls are dispatched to a worker thread to avoid blocking
+    the asyncio event loop.
+    """
+    stats = {
+        "attempted": len(payloads),
+        "enriched": 0,
+        "errors": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    if not payloads:
+        return stats
+    if not api_key:
+        logger.warning(
+            "KAN-199: ANTHROPIC_API_KEY not set — skipping per-payload AI "
+            "enrichment; integration_tags will remain empty for this run."
+        )
+        return stats
+
+    try:
+        import anthropic
+    except ImportError:
+        logger.warning(
+            "KAN-199: anthropic SDK not installed — skipping per-payload AI "
+            "enrichment. Add `anthropic` to requirements.txt to enable."
+        )
+        return stats
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    for payload in payloads:
+        repo_label = f"{payload.get('owner')}/{payload.get('name')}"
+        try:
+            # Build the same context shape the existing AI enricher uses.
+            context_row = {
+                "owner": payload.get("owner") or "",
+                "name": payload.get("name") or "",
+                "description": payload.get("description"),
+                "primary_language": payload.get("primary_language"),
+                "forked_from": payload.get("forked_from"),
+                "dependencies": payload.get("dependencies"),
+            }
+            prompt = ENRICHMENT_PROMPT.format(
+                repo_context=_build_repo_context(context_row)
+            )
+
+            def _call_claude():
+                return client.messages.create(
+                    model=model,
+                    max_tokens=800,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+
+            response = await asyncio.to_thread(_call_claude)
+            stats["input_tokens"] += response.usage.input_tokens
+            stats["output_tokens"] += response.usage.output_tokens
+
+            data = _parse_enrichment_response(response.content[0].text)
+            _merge_ai_fields_into_payload(payload, data)
+            stats["enriched"] += 1
+
+        except Exception as exc:
+            stats["errors"] += 1
+            logger.warning(
+                "KAN-199: AI enrichment failed for %s: %s",
+                repo_label,
+                exc,
+                exc_info=False,
+            )
+            # Best-effort Sentry capture. No-op if sentry-sdk isn't installed
+            # or hasn't been initialized.
+            try:
+                import sentry_sdk
+                sentry_sdk.capture_exception(exc)
+            except Exception:
+                pass
+
+        # Modest courtesy delay to avoid Anthropic rate-limit headwinds on
+        # weekly/full runs. Mirrors the 0.3s sleep in run_ai_enrichment.
+        await asyncio.sleep(0.3)
+
+    return stats
+
+
 async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> None:
     settings = get_settings()
     start_time = time.time()
@@ -363,6 +520,45 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
         enriched_count = len(payloads)
         console.print(f'Enriching with AI... [green]✓[/green]  {enriched_count} repos enriched')
 
+        # KAN-199: AI enrichment on the just-built payloads. Populates
+        # integration_tags + open-taxonomy dimensions BEFORE the API post,
+        # so they flow through /ingest/repos like every other field. Failure
+        # here logs and returns; it MUST NOT abort the structural run.
+        if payloads:
+            with console.status('AI enrichment (KAN-199)...'):
+                try:
+                    ai_stats = await _enrich_payloads_with_ai(
+                        payloads,
+                        api_key=settings.anthropic_api_key,
+                        model=settings.enrichment_model,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "KAN-199: AI enrichment phase crashed; continuing "
+                        "ingestion run. Error: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    try:
+                        import sentry_sdk
+                        sentry_sdk.capture_exception(exc)
+                    except Exception:
+                        pass
+                    ai_stats = {
+                        "attempted": len(payloads),
+                        "enriched": 0,
+                        "errors": len(payloads),
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                    }
+            console.print(
+                f'AI enrichment: [green]✓[/green]  '
+                f'{ai_stats["enriched"]}/{ai_stats["attempted"]} enriched, '
+                f'{ai_stats["errors"]} errors '
+                f'(tokens: {ai_stats["input_tokens"]} in / '
+                f'{ai_stats["output_tokens"]} out)'
+            )
+
         # Post to API
         with console.status('Posting to API...'):
             result = await api_client.upsert_repos(payloads)
@@ -381,6 +577,38 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                 upserted=repos_updated,
                 repo_names=[p['name'] for p in payloads],
             )
+
+        # KAN-199: corpus-wide catch-up — invoke ai_enricher.run_ai_enrichment
+        # for any rows that still have NULL readme_summary in the DB. This is
+        # a no-op once the corpus is fully enriched (the enricher's WHERE
+        # clause filters to the unset population). Runs only on weekly/full
+        # to keep `quick` short; the per-payload pass above covers freshly
+        # ingested repos for `quick` runs.
+        if mode in (RunMode.WEEKLY, RunMode.FULL) and settings.database_url and settings.anthropic_api_key:
+            with console.status('AI enrichment catch-up (KAN-199)...'):
+                try:
+                    catchup_stats = await run_ai_enrichment(
+                        db_url=settings.database_url,
+                        api_key=settings.anthropic_api_key,
+                        model=settings.enrichment_model,
+                    )
+                    console.print(
+                        f'AI catch-up: [green]✓[/green]  '
+                        f'{catchup_stats.enriched}/{catchup_stats.total} enriched, '
+                        f'{catchup_stats.errors} errors'
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "KAN-199: AI catch-up enrichment crashed; "
+                        "continuing run. Error: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    try:
+                        import sentry_sdk
+                        sentry_sdk.capture_exception(exc)
+                    except Exception:
+                        pass
 
         # Post trend snapshot and gap analysis on weekly/full runs
         if mode in (RunMode.WEEKLY, RunMode.FULL):

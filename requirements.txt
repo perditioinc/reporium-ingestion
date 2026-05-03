@@ -8,6 +8,12 @@ aiosqlite>=0.20.0
 python-dotenv>=1.0.0
 psycopg2-binary>=2.9.10
 google-cloud-storage>=2.19.0
+# KAN-199: AI enrichment in the nightly Cloud Run Job is wired into
+# ingestion/main.py via ingestion.enrichers.ai_enricher. The legacy
+# Dockerfile.enrichment installed `anthropic` inline; promote it to a
+# first-class runtime dep so `python -m ingestion run` works the same in
+# any environment (Cloud Run Job, local dev, tests).
+anthropic>=0.40.0
 
 # Security patches — pin floor versions to address P1 CVEs (2026-04-20 audit)
 aiohttp>=3.13.4         # CVE-2026-34515..34525, CVE-2026-22815 (10 CVEs)
