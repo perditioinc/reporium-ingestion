@@ -24,7 +24,7 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
       - name: Run unit tests
-        run: pytest tests/test_backfill.py tests/test_enrichment.py tests/test_graph_snapshot.py -v -k "not summarizer and not multiple_tags"
+        run: pytest tests/test_backfill.py tests/test_enrichment.py tests/test_graph_snapshot.py tests/test_ai_enrichment_in_nightly.py -v -k "not summarizer and not multiple_tags"
 
   # Integration tests (real PostgreSQL + pgvector)
   integration-tests:
