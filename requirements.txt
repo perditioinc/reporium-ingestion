@@ -22,6 +22,13 @@ filelock>=3.20.3        # CVE-2025-68146, CVE-2026-22701
 authlib>=1.6.11         # GHSA-jj8c-mmj3-mmgv
 pillow>=11.3.0          # PYSEC-2025-61
 
+# Security patches — pin floor versions to address P1 CVEs (2026-04-20 audit)
+aiohttp>=3.13.4         # CVE-2026-34515..34525, CVE-2026-22815 (10 CVEs)
+cryptography>=46.0.7    # CVE-2026-34073, CVE-2026-39892
+filelock>=3.20.3        # CVE-2025-68146, CVE-2026-22701
+authlib>=1.6.11         # GHSA-jj8c-mmj3-mmgv
+pillow>=11.3.0          # PYSEC-2025-61
+
 # Dev / testing
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
