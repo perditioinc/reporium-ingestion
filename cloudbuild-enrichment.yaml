@@ -1,0 +1,15 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.enrichment'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/perditio-platform/cloud-run-source-deploy/reporium-enrichment:latest'
+      - '.'
+images:
+  - 'us-central1-docker.pkg.dev/perditio-platform/cloud-run-source-deploy/reporium-enrichment:latest'
+# sentence-transformers pulls ~2GB of PyTorch; default 10m build timeout is
+# insufficient on cold cache. Mirrors cloudbuild.yaml in reporium-api for the
+# same reason.
+timeout: 1800s

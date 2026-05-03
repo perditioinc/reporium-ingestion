@@ -236,6 +236,17 @@ async def _to_api_payload(
         'github_updated_at': repo.updated_at,
         'your_last_push_at': repo.pushed_at,
         'upstream_last_push_at': fetched.upstream_last_push_at,
+        # KAN-DRAFT-trends-payload-timestamps: github_created_at and forked_at
+        # were silently omitted, leaving both columns blank in the DB. The
+        # /trends "New This Week" panel filters on `github_created_at > NOW() -
+        # INTERVAL '7 days'` and so showed an empty list even though the daily
+        # Cloud Run Job WAS topping the corpus up. GitHub does not expose a
+        # separate "forked_at" timestamp — the convention is forked_at == the
+        # fork's own created_at. For non-forks, forked_at is meaningless, so
+        # we send None (the API schema accepts `datetime | None`, the DB
+        # stores NULL — never the empty string the frontend was choking on).
+        'github_created_at': repo.created_at,
+        'forked_at': repo.created_at if repo.is_fork else None,
         'readme_summary': summary,
         **_compute_activity_score(
             stars=repo.stars or 0,
@@ -610,14 +621,20 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                     except Exception:
                         pass
 
-        # Post trend snapshot and gap analysis on weekly/full runs
-        if mode in (RunMode.WEEKLY, RunMode.FULL):
-            with console.status('Computing trends & gaps...'):
-                snapshot = build_trend_snapshot(payloads)
-                gaps = detect_gaps(snapshot)
-                await api_client.post_trend_snapshot(snapshot)
-                await api_client.post_gap_analysis(gaps)
-            console.print(f'Trends & gaps: [green]✓[/green]  {len(gaps)} gaps detected')
+        # Post trend snapshot and gap analysis on every successful run.
+        #
+        # Previously gated to WEEKLY|FULL only (KAN-DRAFT-trends-daily-snapshot,
+        # PR #71), which left /trends/report empty in production: the daily
+        # Cloud Run Job runs in QUICK mode (see deploy/job.yaml), and the
+        # weekly GHA path was the only writer. Each snapshot is timestamped
+        # (captured_at = now()) so multiple snapshots per day are fine —
+        # they're a time series, not an upsert.
+        with console.status('Computing trends & gaps...'):
+            snapshot = build_trend_snapshot(payloads)
+            gaps = detect_gaps(snapshot)
+            await api_client.post_trend_snapshot(snapshot)
+            await api_client.post_gap_analysis(gaps)
+        console.print(f'Trends & gaps: [green]✓[/green]  {len(gaps)} gaps detected')
 
     elapsed = time.time() - start_time
     total_api_calls = rate_limiter.calls_this_run
