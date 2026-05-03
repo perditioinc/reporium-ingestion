@@ -146,8 +146,9 @@ class ProbeConfig:
 def _normalize_db_url(url: str) -> str:
     """Strip asyncpg-only driver suffix so psycopg2 accepts the URL.
 
-    Mirrors scripts/enrich_new_repos.normalize_db_url() — the same DATABASE_URL
-    secret is used by both async API code and sync ingestion scripts.
+    The same DATABASE_URL secret is used by both async API code and sync
+    ingestion scripts; this helper lets sync callers reuse the async-flavoured
+    secret without a separate variant.
     """
     import urllib.parse
 
