@@ -45,10 +45,13 @@ jobs:
           REPORIUM_API_URL: ${{ secrets.REPORIUM_API_URL }}
           # ReporiumAPIClient reads REPORIUM_API_KEY (Bearer) and INGEST_API_KEY (X-Ingest-Key).
           # After reporium-api PR #182, /ingest/* returns 403 without X-Ingest-Key.
+          # KAN-206 (2026-05-03): the legacy INGESTION_API_KEY env wiring was
+          # dropped here. The orphan GHA secret of the same name is a follow-up
+          # operator action — no application code in this repo reads it
+          # (config.py, deploy/job.yaml, scripts/, .env.example all canonicalize
+          # on INGEST_API_KEY).
           REPORIUM_API_KEY: ${{ secrets.REPORIUM_API_KEY }}
           INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
-          # Preserved in case legacy code paths still read it.
-          INGESTION_API_KEY: ${{ secrets.INGESTION_API_KEY }}
           # KAN-200: README fallback summarizer floor must match the
           # KAN-191 probe's PROBE_SUMMARY_MIN_CHARS (default 50). Set
           # explicitly here so the writer's floor is visible alongside the
