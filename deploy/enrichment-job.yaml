@@ -1,0 +1,91 @@
+# Cloud Run Job: reporium-enrichment
+#
+# Replaces .github/workflows/nightly_enrichment.yml. Runs inside the
+# perditio-platform VPC so it can reach Cloud SQL (reporium-db, private IP)
+# over the socket connector without the Cloud SQL Auth Proxy dance the old
+# workflow required.
+#
+# Structure mirrors the live reporium-graph-build job exactly (verified via
+# `gcloud run jobs describe reporium-graph-build --region us-central1 -o yaml`
+# on 2026-04-21):
+#   * Runtime annotations live on spec.template.metadata.annotations,
+#     NOT top-level metadata.annotations. Top-level annotations on a
+#     Cloud Run Job are ignored at execution time.
+#   * execution-environment=gen2, network-interfaces (default/default), and
+#     vpc-access-egress=private-ranges-only are all required to reach the
+#     private-IP Cloud SQL instance.
+#
+# Placeholders substituted at apply-time: PROJECT_ID, REGION.
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: reporium-enrichment
+spec:
+  template:
+    metadata:
+      annotations:
+        # Attaches the Unix socket at /cloudsql/<connection> inside the container.
+        run.googleapis.com/cloudsql-instances: PROJECT_ID:REGION:reporium-db
+        # gen2 is required for VPC egress + Cloud SQL socket on Cloud Run Jobs.
+        run.googleapis.com/execution-environment: gen2
+        # Direct VPC egress to the default network where reporium-db lives.
+        run.googleapis.com/network-interfaces: '[{"network":"default","subnetwork":"default"}]'
+        # Only route RFC1918 traffic through the VPC; public APIs (Anthropic,
+        # GitHub) continue to use Cloud Run's default egress.
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+    spec:
+      template:
+        spec:
+          # Enrichment touches the Anthropic API and GitHub API; one retry is
+          # sufficient — the script is idempotent (WHERE readme_summary IS NULL).
+          maxRetries: 1
+          # Upper bound: ~60 min for a worst-case backfill of several hundred
+          # repos at 0.3s/request. Normal nightly runs finish in <10 min.
+          timeoutSeconds: 3600
+          # New least-privilege runtime SA (created per deploy/README.md).
+          # Holds ONLY roles/cloudsql.client + accessor on the three secrets
+          # below. Deliberately NOT reusing reporium-ingestion-ci@ (CI deploy
+          # power) or reporium-api@ (broader runtime power) — keeping enrichment
+          # isolated so a compromised enrichment container can't, e.g., publish
+          # to Pub/Sub or touch unrelated secrets.
+          serviceAccountName: reporium-enrichment@PROJECT_ID.iam.gserviceaccount.com
+          containers:
+            - image: us-central1-docker.pkg.dev/PROJECT_ID/cloud-run-source-deploy/reporium-enrichment:latest
+              # Default CMD in Dockerfile.enrichment already runs:
+              #   python scripts/fetch_commit_stats.py && python scripts/enrich_new_repos.py
+              # Override via `gcloud run jobs execute --args=...` for ad-hoc runs.
+              resources:
+                limits:
+                  # sentence-transformers loads all-MiniLM-L6-v2 (~90 MB) plus
+                  # torch; 2Gi leaves headroom for the batch encode step.
+                  cpu: "2"
+                  memory: 2Gi
+              env:
+                # DATABASE_URL resolves to the async URL stored in Secret Manager.
+                # enrich_new_repos.py normalizes +asyncpg → psycopg2 automatically
+                # via normalize_db_url() — see scripts/enrich_new_repos.py:56.
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: reporium-db-url-async
+                      key: latest
+                - name: ANTHROPIC_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: anthropic-api-key
+                      key: latest
+                # Scripts read GH_TOKEN / GITHUB_TOKEN env vars. Secret in
+                # live Secret Manager is named `github-token` (hyphenated
+                # lowercase) — the env var names stay as the scripts expect.
+                - name: GH_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-token
+                      key: latest
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: github-token
+                      key: latest
+                - name: GCP_PROJECT
+                  value: PROJECT_ID
