@@ -1,0 +1,66 @@
+name: Nightly Enrichment Quality Probe
+
+# KAN-191 — closes the "deepest unknown" surfaced by the 4h audit: there was
+# zero gate on what the nightly Anthropic enrichment writes into
+# repos.primary_category / repos.integration_tags / repos.readme_summary.
+#
+# The Cloud Run Job `reporium-ingestion-nightly` runs at 03:00 UTC (see
+# deploy/scheduler.yaml) and typically finishes within ~60 min.
+# This workflow runs at 05:00 UTC — well after enrichment completes,
+# but before the 08:30 UTC graph build picks up potentially-broken data.
+#
+# Non-zero exit fails the workflow → the same Workato → JIRA notify-on-failure
+# pipeline that fires for graph-build failures (KAN-147 pattern) handles
+# alerting. No new alerting plumbing required.
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      sample_size:
+        description: "Sample size override (default 20)"
+        required: false
+        default: ""
+      total_enriched_floor:
+        description: "Total enriched corpus floor override (default 1500)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Enrichment quality probe
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PROBE_SAMPLE_SIZE: ${{ inputs.sample_size }}
+          PROBE_TOTAL_ENRICHED_FLOOR: ${{ inputs.total_enriched_floor }}
+          PROBE_REPORT_DIR: ${{ github.workspace }}/quality_probe_reports
+        run: python -m ingestion.enrichment.quality_probe
+
+      - name: Surface report on failure
+        if: failure()
+        run: |
+          echo "::group::Latest probe report"
+          ls -la quality_probe_reports/ || true
+          for f in quality_probe_reports/*.md; do
+            echo "::group::$f"
+            cat "$f"
+            echo "::endgroup::"
+          done
+          echo "::endgroup::"
