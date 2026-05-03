@@ -49,6 +49,12 @@ jobs:
           INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
           # Preserved in case legacy code paths still read it.
           INGESTION_API_KEY: ${{ secrets.INGESTION_API_KEY }}
+          # KAN-200: README fallback summarizer floor must match the
+          # KAN-191 probe's PROBE_SUMMARY_MIN_CHARS (default 50). Set
+          # explicitly here so the writer's floor is visible alongside the
+          # job, and so a future bump only needs touching this value plus
+          # the probe config in reporium-api.
+          PROBE_SUMMARY_MIN_CHARS: "50"
         run: |
           # Schedule-triggered runs have no `inputs.mode`; default to weekly.
           MODE="${{ inputs.mode || 'weekly' }}"
