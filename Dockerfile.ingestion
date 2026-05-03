@@ -1,0 +1,30 @@
+# Reporium ingestion Cloud Run Job — runs nightly enrichment.
+#
+# Entry point per KAN-199 wiring: `python -m ingestion run --mode quick`.
+# Built fresh on main per KAN-204 to replace the legacy dev-only
+# Dockerfile.enrichment (which was tuned for the now-deleted
+# scripts/enrich_new_repos.py — see KAN-203).
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# System deps (only what's strictly needed by ingestion at runtime —
+# build-essential + libpq-dev for psycopg2-binary / sentence-transformers wheels).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps (KAN-199 promoted `anthropic` into requirements.txt;
+# no inline pip install needed).
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# App code
+COPY ingestion/ ./ingestion/
+COPY scripts/ ./scripts/
+
+ENV PYTHONPATH=/app
+
+# Default entry point — overridable via Cloud Run Job `--command/--args`.
+CMD ["python", "-m", "ingestion", "run", "--mode", "quick"]
