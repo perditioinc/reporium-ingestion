@@ -1,0 +1,26 @@
+# Cloud Build config for the reporium-enrichment Cloud Run Job image.
+# KAN-204: replaces legacy dev-only build configs (Dockerfile.enrichment +
+# cloudbuild-enrichment.yaml were tuned for KAN-203's deleted entry script).
+# Mirrors the style of cloudbuild-graph.yaml.
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.ingestion'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/reporium-enrichment:latest'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/reporium-enrichment:$COMMIT_SHA'
+      - '.'
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/reporium-enrichment'
+
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/reporium-enrichment:latest'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/reporium-enrichment:$COMMIT_SHA'
+
+timeout: 600s
