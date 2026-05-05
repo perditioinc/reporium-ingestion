@@ -397,7 +397,14 @@ async def _enrich_payloads_with_ai(
         )
         return stats
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # KAN-230 follow-up: switch from sync `Anthropic` + asyncio.to_thread to
+    # native `AsyncAnthropic`. The to_thread approach is bottlenecked by the
+    # default thread pool (~5 workers on 1 vCPU containers), which capped
+    # effective concurrency below ENRICHMENT_CONCURRENCY=10 and caused a
+    # 1866-payload run to take ~60 min instead of the predicted ~16. Native
+    # async removes the thread-pool ceiling entirely; the semaphore is the
+    # only concurrency cap that matters.
+    client = anthropic.AsyncAnthropic(api_key=api_key)
     sem = asyncio.Semaphore(ENRICHMENT_CONCURRENCY)
     stats_lock = asyncio.Lock()
 
@@ -418,14 +425,11 @@ async def _enrich_payloads_with_ai(
                     repo_context=_build_repo_context(context_row)
                 )
 
-                def _call_claude():
-                    return client.messages.create(
-                        model=model,
-                        max_tokens=800,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-
-                response = await asyncio.to_thread(_call_claude)
+                response = await client.messages.create(
+                    model=model,
+                    max_tokens=800,
+                    messages=[{"role": "user", "content": prompt}],
+                )
                 data = _parse_enrichment_response(response.content[0].text)
                 _merge_ai_fields_into_payload(payload, data)
 
@@ -451,7 +455,10 @@ async def _enrich_payloads_with_ai(
                 except Exception:
                     pass
 
-    await asyncio.gather(*(_enrich_one(p) for p in payloads))
+    try:
+        await asyncio.gather(*(_enrich_one(p) for p in payloads))
+    finally:
+        await client.close()
 
     return stats
 
