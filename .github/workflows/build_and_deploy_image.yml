@@ -1,4 +1,4 @@
-name: Build + push reporium-ingestion image
+name: Build + push reporium-ingestion images
 
 # KAN-239: previously this repo had Dockerfile.ingestion + cloudbuild-ingestion.yaml
 # (KAN-204) but no automation to fire them. Every commit to main since
@@ -6,12 +6,16 @@ name: Build + push reporium-ingestion image
 # stale code: KAN-228 / KAN-230 / KAN-236 all merged but never deployed,
 # silently widening the gap between source-of-truth and runtime.
 #
-# This workflow closes that gap by building + pushing the image directly via
-# WIF-authenticated docker push (same pattern as reporium-mcp/deploy-http.yml
-# and reporium-api/deploy.yml after KAN-236). Cloud Run Jobs that reference
-# `:latest` (currently reporium-enrichment) pick up the new image on the next
-# execution; jobs that reference a SHA tag would need an additional
-# `gcloud run jobs update --image=...` step here.
+# This workflow closes that gap by building + pushing both runtime images
+# (reporium-enrichment from Dockerfile.ingestion, reporium-graph-build from
+# Dockerfile.graph-build) via WIF-authenticated docker push.
+#
+# - reporium-enrichment is referenced from the Cloud Run Job spec by `:latest`
+#   tag — pushing a new :latest is enough; next execution picks it up.
+# - reporium-graph-build is pinned to a digest in the job spec, so we also
+#   call `gcloud run jobs update --image=...@sha256:...` to point the job at
+#   the freshly-built digest. This keeps the deterministic-pin property while
+#   still picking up code changes.
 
 on:
   push:
@@ -22,7 +26,9 @@ on:
       - "requirements*.txt"
       - "pyproject.toml"
       - "Dockerfile.ingestion"
+      - "Dockerfile.graph-build"
       - "cloudbuild-ingestion.yaml"
+      - "cloudbuild-graph.yaml"
       - ".github/workflows/build_and_deploy_image.yml"
   workflow_dispatch:
 
@@ -35,7 +41,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      IMAGE_REPO: us-central1-docker.pkg.dev/perditio-platform/cloud-run-source-deploy/reporium-enrichment
+      ENRICH_REPO: us-central1-docker.pkg.dev/perditio-platform/cloud-run-source-deploy/reporium-enrichment
+      GRAPH_REPO: us-central1-docker.pkg.dev/perditio-platform/cloud-run-source-deploy/reporium-graph-build
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -48,24 +55,50 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
-      - name: Build + push image
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Build + push reporium-enrichment image
         # Same direct-docker-push pattern as KAN-215 used for reporium-mcp,
         # which avoided the project-wide roles/storage.admin requirement that
         # `gcloud builds submit` needs for its staging bucket.
         run: |
-          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
           docker build \
             -f Dockerfile.ingestion \
-            -t "${IMAGE_REPO}:${{ github.sha }}" \
-            -t "${IMAGE_REPO}:latest" \
+            -t "${ENRICH_REPO}:${{ github.sha }}" \
+            -t "${ENRICH_REPO}:latest" \
             .
-          docker push "${IMAGE_REPO}:${{ github.sha }}"
-          docker push "${IMAGE_REPO}:latest"
+          docker push "${ENRICH_REPO}:${{ github.sha }}"
+          docker push "${ENRICH_REPO}:latest"
 
-      - name: Verify the new image is in AR
+      - name: Build + push reporium-graph-build image
         run: |
-          gcloud artifacts docker images describe \
-            "${IMAGE_REPO}:${{ github.sha }}" \
+          docker build \
+            -f Dockerfile.graph-build \
+            -t "${GRAPH_REPO}:${{ github.sha }}" \
+            -t "${GRAPH_REPO}:latest" \
+            .
+          docker push "${GRAPH_REPO}:${{ github.sha }}"
+          docker push "${GRAPH_REPO}:latest"
+
+      - name: Update reporium-graph-build job spec to new digest
+        # The job spec pins to a digest (deterministic deploy). Resolve the
+        # newly-pushed :<sha> tag back to its digest and update the job in
+        # one shot. reporium-enrichment uses the :latest tag in its job spec
+        # so it doesn't need this step.
+        run: |
+          GRAPH_DIGEST=$(gcloud artifacts docker images describe \
+            "${GRAPH_REPO}:${{ github.sha }}" \
             --project=perditio-platform \
-            --format='value(image_summary.digest)' >/dev/null
-          echo "Pushed ${IMAGE_REPO}:${{ github.sha }} (also tagged :latest)"
+            --format='value(image_summary.digest)')
+          echo "Updating reporium-graph-build job → ${GRAPH_REPO}@${GRAPH_DIGEST}"
+          gcloud run jobs update reporium-graph-build \
+            --region=us-central1 \
+            --project=perditio-platform \
+            --image="${GRAPH_REPO}@${GRAPH_DIGEST}"
+
+      - name: Summary
+        run: |
+          echo "Pushed ${ENRICH_REPO}:${{ github.sha }} (also tagged :latest)"
+          echo "Pushed ${GRAPH_REPO}:${{ github.sha }} (also tagged :latest)"
+          echo "Updated reporium-graph-build job spec to new digest"
