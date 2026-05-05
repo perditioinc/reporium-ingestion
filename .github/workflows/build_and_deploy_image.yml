@@ -1,0 +1,71 @@
+name: Build + push reporium-ingestion image
+
+# KAN-239: previously this repo had Dockerfile.ingestion + cloudbuild-ingestion.yaml
+# (KAN-204) but no automation to fire them. Every commit to main since
+# 2026-05-03 left the deployed `reporium-enrichment` Cloud Run Job running on
+# stale code: KAN-228 / KAN-230 / KAN-236 all merged but never deployed,
+# silently widening the gap between source-of-truth and runtime.
+#
+# This workflow closes that gap by building + pushing the image directly via
+# WIF-authenticated docker push (same pattern as reporium-mcp/deploy-http.yml
+# and reporium-api/deploy.yml after KAN-236). Cloud Run Jobs that reference
+# `:latest` (currently reporium-enrichment) pick up the new image on the next
+# execution; jobs that reference a SHA tag would need an additional
+# `gcloud run jobs update --image=...` step here.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ingestion/**"
+      - "scripts/**"
+      - "requirements*.txt"
+      - "pyproject.toml"
+      - "Dockerfile.ingestion"
+      - "cloudbuild-ingestion.yaml"
+      - ".github/workflows/build_and_deploy_image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Required for Workload Identity Federation token mint.
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_REPO: us-central1-docker.pkg.dev/perditio-platform/cloud-run-source-deploy/reporium-enrichment
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: projects/573778300586/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: reporium-ingestion-ci@perditio-platform.iam.gserviceaccount.com
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Build + push image
+        # Same direct-docker-push pattern as KAN-215 used for reporium-mcp,
+        # which avoided the project-wide roles/storage.admin requirement that
+        # `gcloud builds submit` needs for its staging bucket.
+        run: |
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          docker build \
+            -f Dockerfile.ingestion \
+            -t "${IMAGE_REPO}:${{ github.sha }}" \
+            -t "${IMAGE_REPO}:latest" \
+            .
+          docker push "${IMAGE_REPO}:${{ github.sha }}"
+          docker push "${IMAGE_REPO}:latest"
+
+      - name: Verify the new image is in AR
+        run: |
+          gcloud artifacts docker images describe \
+            "${IMAGE_REPO}:${{ github.sha }}" \
+            --project=perditio-platform \
+            --format='value(image_summary.digest)' >/dev/null
+          echo "Pushed ${IMAGE_REPO}:${{ github.sha }} (also tagged :latest)"
