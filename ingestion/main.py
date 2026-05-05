@@ -13,6 +13,7 @@ Usage:
 import asyncio
 import logging
 import math
+import os
 import sys
 import time
 import json
@@ -340,6 +341,15 @@ def _merge_ai_fields_into_payload(payload: dict, ai_data: dict) -> None:
         payload["maturity_level"] = ai_data["maturity_level"]
 
 
+# KAN-230: bound to ~10 concurrent Anthropic calls. Anthropic's standard
+# tier accepts well past that, but 10× is enough to bring 1866 sequential
+# calls × ~5s each (~2.5h) down to ~16 min — comfortably inside the 30 min
+# Cloud Run Job timeout we want to drop to once cache + parallelism land.
+# Override via env var if Anthropic upgrades the tier or new repo volumes
+# justify a different ceiling.
+ENRICHMENT_CONCURRENCY = int(os.environ.get("ENRICHMENT_CONCURRENCY", "10"))
+
+
 async def _enrich_payloads_with_ai(
     payloads: list[dict],
     *,
@@ -354,6 +364,13 @@ async def _enrich_payloads_with_ai(
     output shape is identical to the `run_ai_enrichment` direct-DB path.
     Anthropic SDK calls are dispatched to a worker thread to avoid blocking
     the asyncio event loop.
+
+    KAN-230: per-payload calls run concurrently under an
+    ``asyncio.Semaphore(ENRICHMENT_CONCURRENCY)`` (default 10). The previous
+    sequential loop took ~5s per call × ~1866 repos = ~2.5h serial, blowing
+    past the Cloud Run Job timeout on every nightly run. Concurrency drops
+    that to ~16 min for the same workload while staying inside Anthropic's
+    rate limits at the standard tier.
     """
     stats = {
         "attempted": len(payloads),
@@ -381,57 +398,60 @@ async def _enrich_payloads_with_ai(
         return stats
 
     client = anthropic.Anthropic(api_key=api_key)
+    sem = asyncio.Semaphore(ENRICHMENT_CONCURRENCY)
+    stats_lock = asyncio.Lock()
 
-    for payload in payloads:
+    async def _enrich_one(payload: dict) -> None:
         repo_label = f"{payload.get('owner')}/{payload.get('name')}"
-        try:
-            # Build the same context shape the existing AI enricher uses.
-            context_row = {
-                "owner": payload.get("owner") or "",
-                "name": payload.get("name") or "",
-                "description": payload.get("description"),
-                "primary_language": payload.get("primary_language"),
-                "forked_from": payload.get("forked_from"),
-                "dependencies": payload.get("dependencies"),
-            }
-            prompt = ENRICHMENT_PROMPT.format(
-                repo_context=_build_repo_context(context_row)
-            )
-
-            def _call_claude():
-                return client.messages.create(
-                    model=model,
-                    max_tokens=800,
-                    messages=[{"role": "user", "content": prompt}],
+        async with sem:
+            try:
+                # Build the same context shape the existing AI enricher uses.
+                context_row = {
+                    "owner": payload.get("owner") or "",
+                    "name": payload.get("name") or "",
+                    "description": payload.get("description"),
+                    "primary_language": payload.get("primary_language"),
+                    "forked_from": payload.get("forked_from"),
+                    "dependencies": payload.get("dependencies"),
+                }
+                prompt = ENRICHMENT_PROMPT.format(
+                    repo_context=_build_repo_context(context_row)
                 )
 
-            response = await asyncio.to_thread(_call_claude)
-            stats["input_tokens"] += response.usage.input_tokens
-            stats["output_tokens"] += response.usage.output_tokens
+                def _call_claude():
+                    return client.messages.create(
+                        model=model,
+                        max_tokens=800,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
 
-            data = _parse_enrichment_response(response.content[0].text)
-            _merge_ai_fields_into_payload(payload, data)
-            stats["enriched"] += 1
+                response = await asyncio.to_thread(_call_claude)
+                data = _parse_enrichment_response(response.content[0].text)
+                _merge_ai_fields_into_payload(payload, data)
 
-        except Exception as exc:
-            stats["errors"] += 1
-            logger.warning(
-                "KAN-199: AI enrichment failed for %s: %s",
-                repo_label,
-                exc,
-                exc_info=False,
-            )
-            # Best-effort Sentry capture. No-op if sentry-sdk isn't installed
-            # or hasn't been initialized.
-            try:
-                import sentry_sdk
-                sentry_sdk.capture_exception(exc)
-            except Exception:
-                pass
+                async with stats_lock:
+                    stats["input_tokens"] += response.usage.input_tokens
+                    stats["output_tokens"] += response.usage.output_tokens
+                    stats["enriched"] += 1
 
-        # Modest courtesy delay to avoid Anthropic rate-limit headwinds on
-        # weekly/full runs. Mirrors the 0.3s sleep in run_ai_enrichment.
-        await asyncio.sleep(0.3)
+            except Exception as exc:
+                async with stats_lock:
+                    stats["errors"] += 1
+                logger.warning(
+                    "KAN-199: AI enrichment failed for %s: %s",
+                    repo_label,
+                    exc,
+                    exc_info=False,
+                )
+                # Best-effort Sentry capture. No-op if sentry-sdk isn't installed
+                # or hasn't been initialized.
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception(exc)
+                except Exception:
+                    pass
+
+    await asyncio.gather(*(_enrich_one(p) for p in payloads))
 
     return stats
 
