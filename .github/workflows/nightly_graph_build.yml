@@ -9,16 +9,23 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # KAN-236: required for Workload Identity Federation
 
 jobs:
   build-graph:
     runs-on: ubuntu-latest
 
     steps:
+      # KAN-236: migrated from GCP_SA_KEY (long-lived JSON key) to Workload
+      # Identity Federation. Uses the github-pool/github-provider that was
+      # set up under KAN-210 / reporium-mcp; the reporium-ingestion-ci SA
+      # has the matching workloadIdentityUser binding for
+      # principalSet=attribute.repository/perditioinc/reporium-ingestion.
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: projects/573778300586/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: reporium-ingestion-ci@perditio-platform.iam.gserviceaccount.com
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
