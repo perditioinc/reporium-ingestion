@@ -548,8 +548,20 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
             progress.update(task, completed=len(all_repos))
 
         api_calls_fetch = rate_limiter.calls_this_run
+        # KAN-230: explicit phase boundaries on the structured logger so a
+        # silent timeout becomes traceable. The Rich `console.status(...)`
+        # spinner suppresses everything until the phase completes; once a
+        # phase hangs, you cannot tell from the logs which phase you are
+        # in. logger.info() bypasses the spinner and lands in Cloud Logging
+        # immediately.
+        logger.info(
+            "phase: fetch_changed_repos complete (api_calls=%d, fetched=%d)",
+            api_calls_fetch,
+            len(fetched_repos),
+        )
 
         # Enrich with AI
+        logger.info("phase: building payloads (summarizer pass) — count=%d", len(fetched_repos))
         with console.status('Enriching with AI...'):
             for fetched in fetched_repos:
                 payload = await _to_api_payload(fetched, summarizer)
@@ -557,12 +569,14 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
 
         enriched_count = len(payloads)
         console.print(f'Enriching with AI... [green]✓[/green]  {enriched_count} repos enriched')
+        logger.info("phase: payload build complete — count=%d", enriched_count)
 
         # KAN-199: AI enrichment on the just-built payloads. Populates
         # integration_tags + open-taxonomy dimensions BEFORE the API post,
         # so they flow through /ingest/repos like every other field. Failure
         # here logs and returns; it MUST NOT abort the structural run.
         if payloads:
+            logger.info("phase: AI enrichment (KAN-199) starting — count=%d", len(payloads))
             with console.status('AI enrichment (KAN-199)...'):
                 try:
                     ai_stats = await _enrich_payloads_with_ai(
@@ -596,13 +610,22 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                 f'(tokens: {ai_stats["input_tokens"]} in / '
                 f'{ai_stats["output_tokens"]} out)'
             )
+            logger.info(
+                "phase: AI enrichment complete — enriched=%d errors=%d input_tokens=%d output_tokens=%d",
+                ai_stats["enriched"],
+                ai_stats["errors"],
+                ai_stats["input_tokens"],
+                ai_stats["output_tokens"],
+            )
 
         # Post to API
+        logger.info("phase: posting to API — payloads=%d", len(payloads))
         with console.status('Posting to API...'):
             result = await api_client.upsert_repos(payloads)
             repos_updated = result.upserted
 
         console.print(f'Posting to API... [green]✓[/green]  {repos_updated} repos updated')
+        logger.info("phase: API post complete — upserted=%d errors=%d", repos_updated, len(result.errors))
         if result.errors:
             for err in result.errors[:5]:
                 console.print(f'  [red]⚠ {err}[/red]')
