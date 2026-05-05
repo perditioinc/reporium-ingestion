@@ -62,12 +62,24 @@ class _StubMessages:
         return _StubMessage(self._response_text)
 
 
+class _AsyncStubMessages(_StubMessages):
+    """KAN-230: production code now uses anthropic.AsyncAnthropic, so the
+    messages.create() entry point must be a coroutine. This subclass
+    overrides only the entry point — all other attributes (calls list,
+    response config) inherit from the sync stub used in earlier tests.
+    """
+
+    async def create(self, *, model: str, max_tokens: int, messages: list[dict]) -> _StubMessage:
+        return _StubMessages.create(self, model=model, max_tokens=max_tokens, messages=messages)
+
+
 class _StubAnthropicClient:
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
         self.messages = _StubMessages(_StubAnthropicClient._next_response)
 
     # Class-level slot so each test can configure what the stub returns.
+    # Both _StubAnthropicClient and _StubAsyncAnthropicClient share this.
     _next_response: str = json.dumps(
         {
             "readme_summary": (
@@ -92,6 +104,17 @@ class _StubAnthropicClient:
     )
 
 
+class _StubAsyncAnthropicClient:
+    """KAN-230 follow-up: stand-in for `anthropic.AsyncAnthropic`."""
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+        self.messages = _AsyncStubMessages(_StubAnthropicClient._next_response)
+
+    async def close(self) -> None:
+        pass
+
+
 @pytest.fixture
 def stub_anthropic(monkeypatch):
     """Install a stub `anthropic` module so `import anthropic` succeeds."""
@@ -102,6 +125,7 @@ def stub_anthropic(monkeypatch):
 
     fake_mod = types.ModuleType("anthropic")
     fake_mod.Anthropic = _StubAnthropicClient
+    fake_mod.AsyncAnthropic = _StubAsyncAnthropicClient
 
     class _APIError(Exception):
         pass
