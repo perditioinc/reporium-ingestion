@@ -1,9 +1,17 @@
 name: Nightly Graph Build
 
 on:
-  # 8:30 UTC daily — 90 min after nightly enrichment starts at 07:00 UTC
+  # Dual build cadence — close the ALTERNATIVE_TO precision drift window
+  # between graph-build runs. Trust-score probe (hourly) was repeatedly
+  # catching ALT precision dropping below the 0.7 floor in the early
+  # morning UTC hours when the previous build was 20h+ old. The second
+  # cron at 14:30 UTC halves the window to ~6h between rebuilds.
+  #   - 08:30 UTC: 90 min after nightly enrichment at 07:00 UTC.
+  #   - 14:30 UTC: refresh once category drift from any post-enrichment
+  #                ingest / admin write has had time to land.
   schedule:
     - cron: "30 8 * * *"
+    - cron: "30 14 * * *"
   # Also allow manual trigger for on-demand rebuilds
   workflow_dispatch:
 
