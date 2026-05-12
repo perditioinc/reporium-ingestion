@@ -265,33 +265,24 @@ async def run_ai_enrichment(
             text = response.content[0].text
             data = _parse_enrichment_response(text)
 
-            # Write core fields to database
+            # KAN-227: write only the three real `repos` columns. The eight
+            # other taxonomy dimensions returned by Claude (quality_assessment,
+            # maturity_level, skill_areas, industries, use_cases, modalities,
+            # ai_trends, deployment_context) were never added to the Alembic
+            # schema — they are routed through repo_taxonomy via
+            # /ingest/repos/{name}/enrich for the fresh-fetch path. Writing
+            # them here previously raised UndefinedColumn and was silently
+            # swallowed by the catch-all below, rolling back the entire row.
             cur.execute(
                 """UPDATE repos SET
                     readme_summary = %s,
                     problem_solved = %s,
-                    integration_tags = %s::jsonb,
-                    quality_assessment = %s,
-                    maturity_level = %s,
-                    skill_areas = %s::jsonb,
-                    industries = %s::jsonb,
-                    use_cases = %s::jsonb,
-                    modalities = %s::jsonb,
-                    ai_trends = %s::jsonb,
-                    deployment_context = %s::jsonb
+                    integration_tags = %s::jsonb
                 WHERE id = %s""",
                 (
                     data.get("readme_summary"),
                     data.get("problem_solved"),
                     json.dumps(data.get("integration_tags", [])),
-                    data.get("quality_assessment"),
-                    data.get("maturity_level"),
-                    json.dumps(data.get("skill_areas", [])),
-                    json.dumps(data.get("industries", [])),
-                    json.dumps(data.get("use_cases", [])),
-                    json.dumps(data.get("modalities", [])),
-                    json.dumps(data.get("ai_trends", [])),
-                    json.dumps(data.get("deployment_context", [])),
                     repo["id"],
                 ),
             )
@@ -313,10 +304,21 @@ async def run_ai_enrichment(
             # Brief pause on API errors
             await asyncio.sleep(2)
 
+        except psycopg2.errors.UndefinedColumn as e:
+            # KAN-227: schema drift used to land here silently. If this
+            # branch fires after the fix, the schema has drifted again and
+            # we want the whole run to fail loud rather than rolling back
+            # every row.
+            stats.errors += 1
+            stats.error_repos.append(repo_name)
+            logger.error("SCHEMA DRIFT for %s (failing the whole batch): %s", repo_name, e)
+            conn.rollback()
+            raise
+
         except Exception as e:
             stats.errors += 1
             stats.error_repos.append(repo_name)
-            logger.warning("Unexpected error for %s: %s", repo_name, e)
+            logger.error("Unexpected enrichment error for %s: %s", repo_name, e, exc_info=True)
             conn.rollback()
 
         # Progress + checkpoint every 50 repos
