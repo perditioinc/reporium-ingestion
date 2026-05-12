@@ -282,7 +282,7 @@ async def run_ai_enrichment(
                 (
                     data.get("readme_summary"),
                     data.get("problem_solved"),
-                    json.dumps(data.get("integration_tags", [])),
+                    json.dumps(data.get("integration_tags") or []),
                     repo["id"],
                 ),
             )
@@ -304,10 +304,13 @@ async def run_ai_enrichment(
             # Brief pause on API errors
             await asyncio.sleep(2)
 
-        except psycopg2.errors.UndefinedColumn as e:
-            # KAN-227: schema drift used to land here silently. If this
-            # branch fires after the fix, the schema has drifted again and
-            # we want the whole run to fail loud rather than rolling back
+        except psycopg2.ProgrammingError as e:
+            # KAN-227 + Codex review: schema-contract drift (UndefinedColumn,
+            # UndefinedTable, DatatypeMismatch, InvalidTextRepresentation,
+            # SyntaxError) used to land in the generic catch-all silently.
+            # ProgrammingError is the psycopg2 parent for all of these. If
+            # this branch fires post-fix, the schema has drifted again and
+            # we want the whole batch to fail loud rather than rolling back
             # every row.
             stats.errors += 1
             stats.error_repos.append(repo_name)
