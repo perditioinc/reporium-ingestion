@@ -28,7 +28,7 @@ from rich.panel import Panel
 from rich import print as rprint
 
 from .config import get_settings, RunMode
-from .cache.database import CacheDatabase
+from .cache import build_cache_database
 from .github.rate_limit import RateLimitManager
 from .github.client import GitHubClient
 from .github.fetcher import RepoFetcher, FetchedRepo
@@ -469,7 +469,7 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
 
     console.rule(f'[bold blue]Reporium Ingestion — {mode.value.capitalize()} Mode[/bold blue]')
 
-    db = CacheDatabase(settings.cache_db_path)
+    db = build_cache_database(settings)
     await db.init()
 
     rate_limiter = RateLimitManager(min_buffer=settings.min_rate_limit_buffer)
@@ -734,7 +734,7 @@ async def show_status() -> None:
     settings = get_settings()
     console.rule('[bold]Reporium Ingestion — Status[/bold]')
 
-    db = CacheDatabase(settings.cache_db_path)
+    db = build_cache_database(settings)
     await db.init()
 
     stats = await db.get_cache_stats()
@@ -759,7 +759,7 @@ async def show_status() -> None:
 
 async def show_cache_stats() -> None:
     settings = get_settings()
-    db = CacheDatabase(settings.cache_db_path)
+    db = build_cache_database(settings)
     await db.init()
     stats = await db.get_cache_stats()
 
@@ -771,7 +771,7 @@ async def show_cache_stats() -> None:
 
 async def clean_cache(days: int = 90) -> None:
     settings = get_settings()
-    db = CacheDatabase(settings.cache_db_path)
+    db = build_cache_database(settings)
     await db.init()
     removed = await db.clean_stale(days)
     console.print(f'[green]Removed {removed} stale cache entries (older than {days} days)[/green]')
