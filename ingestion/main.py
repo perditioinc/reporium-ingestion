@@ -463,13 +463,29 @@ async def _enrich_payloads_with_ai(
     return stats
 
 
+def _make_cache(settings):
+    """Select the cache backend (KAN-230).
+
+    Durable Postgres cache (survives Cloud Run Job executions) when
+    DATABASE_URL is a postgres URL; the module-level SQLite ``CacheDatabase``
+    otherwise (local/dev/tests). The factory import is lazy and gated on a
+    string check so unit tests that stub ``ingestion.cache`` or monkeypatch
+    ``main.CacheDatabase`` keep working unchanged.
+    """
+    url = getattr(settings, "database_url", "") or ""
+    if isinstance(url, str) and url.strip().lower().startswith(("postgres://", "postgresql")):
+        from .cache import build_cache_database
+        return build_cache_database(settings)
+    return CacheDatabase(settings.cache_db_path)
+
+
 async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> None:
     settings = get_settings()
     start_time = time.time()
 
     console.rule(f'[bold blue]Reporium Ingestion — {mode.value.capitalize()} Mode[/bold blue]')
 
-    db = CacheDatabase(settings.cache_db_path)
+    db = _make_cache(settings)
     await db.init()
 
     rate_limiter = RateLimitManager(min_buffer=settings.min_rate_limit_buffer)
@@ -734,7 +750,7 @@ async def show_status() -> None:
     settings = get_settings()
     console.rule('[bold]Reporium Ingestion — Status[/bold]')
 
-    db = CacheDatabase(settings.cache_db_path)
+    db = _make_cache(settings)
     await db.init()
 
     stats = await db.get_cache_stats()
@@ -759,7 +775,7 @@ async def show_status() -> None:
 
 async def show_cache_stats() -> None:
     settings = get_settings()
-    db = CacheDatabase(settings.cache_db_path)
+    db = _make_cache(settings)
     await db.init()
     stats = await db.get_cache_stats()
 
@@ -771,7 +787,7 @@ async def show_cache_stats() -> None:
 
 async def clean_cache(days: int = 90) -> None:
     settings = get_settings()
-    db = CacheDatabase(settings.cache_db_path)
+    db = _make_cache(settings)
     await db.init()
     removed = await db.clean_stale(days)
     console.print(f'[green]Removed {removed} stale cache entries (older than {days} days)[/green]')
