@@ -350,6 +350,97 @@ def _merge_ai_fields_into_payload(payload: dict, ai_data: dict) -> None:
 ENRICHMENT_CONCURRENCY = int(os.environ.get("ENRICHMENT_CONCURRENCY", "10"))
 
 
+def _enrich_force_all() -> bool:
+    """KAN-230: opt-in full re-enrich override.
+
+    Read at call time (not import) so tests and ops can flip it per run.
+    Truthy values: ``1``, ``true``, ``yes`` (case-insensitive). Default OFF.
+    """
+    return os.environ.get("ENRICH_FORCE_ALL", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _needs_ai_enrichment(fetched: "FetchedRepo", *, force_all: bool) -> bool:
+    """KAN-230 gating predicate: should this repo be sent to Claude this run?
+
+    Root cause this fixes: `ingestion.main` built a payload for every fetched
+    repo and called the per-payload Claude pass on the ENTIRE ~1866-repo
+    corpus every nightly run. With no "already enriched / unchanged" filter
+    the run blew past the Cloud Run Job timeout and `integration_tags` never
+    persisted (Nightly Enrichment Quality Probe red since ~2026-05-12).
+
+    The durable, post-#96 signal that a repo has already been fully processed
+    (and therefore already enriched on a prior run) is its ``repo_cache`` row,
+    which now lives in PostgreSQL and survives across Cloud Run Job
+    executions. A repo is "unchanged & already processed" — and so must be
+    skipped — iff ALL of:
+
+      * a durable cache row exists, AND
+      * ``cache.daily_fetched_at`` is set (it went through a full daily
+        fetch at least once → the per-payload enricher already ran for it
+        on that run), AND
+      * ``cache.github_updated_at`` equals the repo's current GitHub
+        ``updated_at`` (GitHub has not changed it since).
+
+    This mirrors the existing ``CacheDatabase.needs_daily_fetch`` logic —
+    the same change signal that already drives the structural fetch tiers —
+    so gating cannot drift from fetch behaviour. No DB schema change.
+
+    Returns ``True`` (enrich) for: ``force_all``; never-seen repos (no cache
+    row); repos fetched only at the permanent tier (``daily_fetched_at`` is
+    ``None``); and repos whose GitHub ``updated_at`` moved since last
+    processed. Returns ``False`` only for the unchanged-and-processed case.
+    """
+    if force_all:
+        return True
+
+    cache = getattr(fetched, "cache", None)
+    repo = fetched.github_repo
+
+    # Never-seen repo: FetchedRepo synthesizes an empty RepoCacheRow when the
+    # DB had no row, so a missing row presents as cache.daily_fetched_at=None
+    # and cache.github_updated_at=None — both caught below. Guard None too in
+    # case a caller passes a bare FetchedRepo.
+    if cache is None:
+        return True
+
+    # Never fully processed (only permanent tier, or brand new) → enrich.
+    if not cache.daily_fetched_at:
+        return True
+
+    # GitHub changed the repo since we last processed it → re-enrich.
+    if cache.github_updated_at != repo.updated_at:
+        return True
+
+    # Cache row + daily fetch + unchanged updated_at → already enriched on a
+    # prior run and nothing changed. Skip the Claude call.
+    return False
+
+
+def _select_payloads_for_enrichment(
+    pairs: list[tuple[dict, "FetchedRepo"]],
+) -> list[dict]:
+    """KAN-230: from (payload, fetched) pairs, return only the payloads whose
+    repo still needs AI enrichment this run.
+
+    Structural payloads for ALL repos are still built and posted to the API
+    by the caller (freshness of stars/commits/timeline is unaffected); this
+    only trims the expensive per-payload Claude pass to new/changed/forced
+    repos. WEEKLY/FULL still run the corpus-wide ``run_ai_enrichment``
+    catch-up (its own NULL-``readme_summary`` WHERE clause), so genuinely
+    under-enriched older rows are still backfilled there.
+    """
+    force_all = _enrich_force_all()
+    return [
+        payload
+        for payload, fetched in pairs
+        if _needs_ai_enrichment(fetched, force_all=force_all)
+    ]
+
+
 async def _enrich_payloads_with_ai(
     payloads: list[dict],
     *,
@@ -578,25 +669,57 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
 
         # Enrich with AI
         logger.info("phase: building payloads (summarizer pass) — count=%d", len(fetched_repos))
+        # KAN-230: keep each payload paired with its FetchedRepo so the
+        # enrichment gate can read the durable (post-#96 Postgres) cache
+        # snapshot. ALL payloads are still built and posted to the API —
+        # structural freshness (stars/commits/timeline) is unaffected.
+        enrich_pairs: list[tuple[dict, FetchedRepo]] = []
         with console.status('Enriching with AI...'):
             for fetched in fetched_repos:
                 payload = await _to_api_payload(fetched, summarizer)
                 payloads.append(payload)
+                enrich_pairs.append((payload, fetched))
 
         enriched_count = len(payloads)
         console.print(f'Enriching with AI... [green]✓[/green]  {enriched_count} repos enriched')
         logger.info("phase: payload build complete — count=%d", enriched_count)
 
-        # KAN-199: AI enrichment on the just-built payloads. Populates
+        # KAN-230: gate the expensive per-payload Claude pass. Without this,
+        # `_enrich_payloads_with_ai` was called on the ENTIRE ~1866-repo
+        # corpus every nightly run — ~1866 Claude calls that blew past the
+        # Cloud Run Job timeout, so `integration_tags` never persisted and
+        # `COMPATIBLE_WITH` edges stayed dead. We now only enrich repos that
+        # are new, changed, or forced (ENRICH_FORCE_ALL=1). Unchanged repos
+        # that were already enriched on a prior run are skipped — their AI
+        # fields already landed in the DB and the API `_upsert_repo`
+        # skip-empty guard means re-posting their structural payload with
+        # empty AI fields does NOT clobber them.
+        payloads_to_enrich = _select_payloads_for_enrichment(enrich_pairs)
+        _force_all = _enrich_force_all()
+        logger.info(
+            "phase: enrichment gate — total=%d to_enrich=%d skipped=%d force_all=%s",
+            len(enrich_pairs),
+            len(payloads_to_enrich),
+            len(enrich_pairs) - len(payloads_to_enrich),
+            _force_all,
+        )
+        console.print(
+            f'Enrichment gate (KAN-230): [cyan]{len(payloads_to_enrich)}[/cyan] '
+            f'to enrich, [dim]{len(enrich_pairs) - len(payloads_to_enrich)} '
+            f'unchanged/skipped[/dim]'
+            + ('  [yellow](ENRICH_FORCE_ALL)[/yellow]' if _force_all else '')
+        )
+
+        # KAN-199: AI enrichment on the gated payloads. Populates
         # integration_tags + open-taxonomy dimensions BEFORE the API post,
         # so they flow through /ingest/repos like every other field. Failure
         # here logs and returns; it MUST NOT abort the structural run.
-        if payloads:
-            logger.info("phase: AI enrichment (KAN-199) starting — count=%d", len(payloads))
+        if payloads_to_enrich:
+            logger.info("phase: AI enrichment (KAN-199) starting — count=%d", len(payloads_to_enrich))
             with console.status('AI enrichment (KAN-199)...'):
                 try:
                     ai_stats = await _enrich_payloads_with_ai(
-                        payloads,
+                        payloads_to_enrich,
                         api_key=settings.anthropic_api_key,
                         model=settings.enrichment_model,
                     )
@@ -613,9 +736,9 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                     except Exception:
                         pass
                     ai_stats = {
-                        "attempted": len(payloads),
+                        "attempted": len(payloads_to_enrich),
                         "enriched": 0,
-                        "errors": len(payloads),
+                        "errors": len(payloads_to_enrich),
                         "input_tokens": 0,
                         "output_tokens": 0,
                     }
