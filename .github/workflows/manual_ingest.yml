@@ -1,76 +1,96 @@
 name: Manual Ingestion Run
 
+# Triggers the reporium-enrichment Cloud Run JOB (which runs
+# `python -m ingestion run --mode <mode>`). Previously this workflow ran
+# ingestion directly on the GitHub runner, but the prod DB is Cloud SQL reached
+# via a unix socket (/cloudsql/perditio-platform:us-central1:reporium-db) that
+# only exists inside Cloud Run — so the runner-based path failed every week with
+# `psycopg2.OperationalError ... No such file or directory`. Executing the Cloud
+# Run job instead runs the same code where the DB (and the github-token secret)
+# are actually reachable. Same WIF + execute pattern as nightly_graph_build.yml.
+
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run mode (quick / weekly / full)"
+        description: "Run mode (ignored if fix_repos is set)"
         type: choice
         options:
+          - quick
           - weekly
           - full
-          - quick
-        default: weekly
+        default: quick
       fix_repos:
         description: "Comma-separated repo names to re-ingest (leave blank for all)"
         required: false
         default: ""
   schedule:
-    # Weekly cadence to keep trend_snapshots populated. Mondays 09:00 UTC.
+    # Weekly cadence to keep commit stats / trend_snapshots fresh. Mondays 09:00 UTC.
     - cron: '0 9 * * 1'
 
 permissions:
   contents: read
+  id-token: write   # required for Workload Identity Federation
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 180  # full mode can take up to 3 hours for 1,460 repos
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
-          python-version: "3.11"
+          workload_identity_provider: projects/573778300586/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: reporium-ingestion-ci@perditio-platform.iam.gserviceaccount.com
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
-      - name: Run ingestion
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          GH_USERNAME: ${{ secrets.GH_USERNAME }}
-          REPORIUM_API_URL: ${{ secrets.REPORIUM_API_URL }}
-          # ReporiumAPIClient reads REPORIUM_API_KEY (Bearer) and INGEST_API_KEY (X-Ingest-Key).
-          # After reporium-api PR #182, /ingest/* returns 403 without X-Ingest-Key.
-          # KAN-206 (2026-05-03): the legacy INGESTION_API_KEY env wiring was
-          # dropped here. The orphan GHA secret of the same name is a follow-up
-          # operator action — no application code in this repo reads it
-          # (config.py, deploy/job.yaml, scripts/, .env.example all canonicalize
-          # on INGEST_API_KEY).
-          REPORIUM_API_KEY: ${{ secrets.REPORIUM_API_KEY }}
-          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
-          # KAN-200: README fallback summarizer floor must match the
-          # KAN-191 probe's PROBE_SUMMARY_MIN_CHARS (default 50). Set
-          # explicitly here so the writer's floor is visible alongside the
-          # job, and so a future bump only needs touching this value plus
-          # the probe config in reporium-api.
-          PROBE_SUMMARY_MIN_CHARS: "50"
+      - name: Execute reporium-enrichment Cloud Run Job
+        id: ingest_job
         run: |
-          # Schedule-triggered runs have no `inputs.mode`; default to weekly.
-          MODE="${{ inputs.mode || 'weekly' }}"
-          FIX_REPOS="${{ inputs.fix_repos }}"
-
+          MODE="${{ github.event.inputs.mode || 'quick' }}"
+          FIX_REPOS="${{ github.event.inputs.fix_repos }}"
           if [ -n "$FIX_REPOS" ]; then
-            echo "Running fix mode for repos: $FIX_REPOS"
-            # NB: `fix` is its own CLI subcommand (main.py:506). The previous
-            # form `run --mode fix --repos ...` silently dropped --repos because
-            # the `run` branch only parses --mode, so every fix-mode dispatch
-            # was degenerating into a full 1852-repo scan and hanging.
-            python -m ingestion fix --repos "$FIX_REPOS"
+            # `fix` is its own CLI subcommand (main.py); pass --repos to it.
+            ARGS="fix,--repos,$FIX_REPOS"
+            echo "Executing reporium-enrichment in FIX mode for: $FIX_REPOS"
           else
-            echo "Running ingestion in $MODE mode for all repos"
-            python -m ingestion run --mode "$MODE"
+            ARGS="-m,ingestion,run,--mode,$MODE"
+            echo "Executing reporium-enrichment Cloud Run Job (mode=$MODE)..."
+          fi
+          gcloud run jobs execute reporium-enrichment \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --args="$ARGS" \
+            --wait
+          echo "Cloud Run Job completed successfully"
+
+      - name: Surface Cloud Run Job diagnostics on failure
+        if: failure() && steps.ingest_job.outcome == 'failure'
+        run: |
+          echo "::group::Recent reporium-enrichment executions"
+          gcloud run jobs executions list \
+            --job=reporium-enrichment \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --limit=3 \
+            --format='table(metadata.name,status.startTime,status.completionTime,status.conditions[0].type,status.conditions[0].message)' || true
+          echo "::endgroup::"
+
+          LATEST=$(gcloud run jobs executions list \
+            --job=reporium-enrichment \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --limit=1 \
+            --format='value(metadata.name)' 2>/dev/null || true)
+          if [ -n "$LATEST" ]; then
+            echo "::group::Last 200 log lines for $LATEST"
+            gcloud logging read \
+              "resource.type=cloud_run_job AND resource.labels.job_name=reporium-enrichment AND labels.\"run.googleapis.com/execution_name\"=$LATEST" \
+              --project=perditio-platform \
+              --limit=200 \
+              --format='value(timestamp,severity,textPayload)' \
+              --order=asc || true
+            echo "::endgroup::"
           fi
