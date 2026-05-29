@@ -189,6 +189,27 @@ def _refresh_commit_stats_blocking(
     return {"updated": updated, "skipped": skipped, "errors": errors}
 
 
+def _apply_cached_forked_from(all_repos: list, cached: dict) -> int:
+    """Fill `forked_from` on forks from the durable cache so the subsequent
+    hydrate_fork_parents() call only has to API-fetch genuinely NEW forks.
+
+    The repo-list endpoint omits `parent`, so every fork arrives with
+    forked_from=None; hydrating all of them costs ~1 GitHub call per fork
+    (~1900 calls / ~27 min for this corpus) on every run. Repos we've already
+    ingested have forked_from stored in cache, so we reuse it here and leave
+    only brand-new forks for the API. Mutates `all_repos` in place; returns the
+    number of forks populated from cache.
+    """
+    filled = 0
+    for repo in all_repos:
+        if getattr(repo, "is_fork", False) and getattr(repo, "forked_from", None) is None:
+            cached_row = cached.get(repo.name)
+            if cached_row is not None and getattr(cached_row, "forked_from", None):
+                repo.forked_from = cached_row.forked_from
+                filled += 1
+    return filled
+
+
 def _build_language_percentages(breakdown: dict[str, int]) -> dict[str, float]:
     total = sum(breakdown.values())
     if not total:
@@ -714,16 +735,25 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
             else:
                 all_repos = await gh_client.get_repos(settings.gh_username)
 
-        # Hydrate forked_from via secondary fetch. The list endpoint returns
-        # the minimal-repository schema which omits `parent`, so forks come
-        # back with forked_from=None. Done after the fix_repos filter so a
-        # fix-mode run for 6 repos only makes ~6 extra API calls instead of
-        # one per fork in the entire account (~900, 7+ min at rate-limit).
+        # Load the durable cache ONCE, up front. It already stores forked_from
+        # for every fork we've seen, so we can fill that in locally and let
+        # hydrate_fork_parents API-fetch only genuinely NEW forks. Previously
+        # the caller hydrated ALL ~1900 forks every run (~1900 API calls / ~27
+        # min — the dominant cost of the corpus-scale run that kept tripping the
+        # Cloud Run task timeout). See hydrate_fork_parents' own docstring.
+        cached = {r.name: r for r in await db.get_all_repos()}
+        from_cache = _apply_cached_forked_from(all_repos, cached)
+
+        # Hydrate forked_from for the remaining (new) forks via secondary fetch.
+        # The list endpoint omits `parent`, so brand-new forks still have None.
         with console.status('Hydrating fork parents...'):
             await gh_client.hydrate_fork_parents(all_repos)
 
         api_calls_after_list = rate_limiter.calls_this_run
-        console.print(f'Fetching repo list... [green]✓[/green]  {len(all_repos)} repos ({api_calls_after_list} API calls)')
+        console.print(
+            f'Fetching repo list... [green]✓[/green]  {len(all_repos)} repos '
+            f'({api_calls_after_list} API calls; {from_cache} fork parents from cache)'
+        )
 
         # Estimate budget
         est = rate_limiter.estimate_calls(len(all_repos), mode)
@@ -737,9 +767,8 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                 console.print(f'[yellow]Waiting {budget.wait_seconds}s for rate limit reset...[/yellow]')
                 await asyncio.sleep(budget.wait_seconds)
 
-        # Check cache
+        # Check cache (reuse the dict loaded above for fork-parent hydration)
         with console.status('Checking cache...'):
-            cached = {r.name: r for r in await db.get_all_repos()}
             unchanged = sum(
                 1 for repo in all_repos
                 if repo.name in cached and cached[repo.name].github_updated_at == repo.updated_at
@@ -873,7 +902,11 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
         # fresh upstream /stats/commit_activity BEFORE posting, so the counts
         # flow through the API payload AND the trend snapshot below. Bounded by
         # the GitHub rate limit; COMMIT_STATS_MAX_REPOS caps it per run (0 = all).
-        if settings.gh_token and enrich_pairs:
+        # COMMIT_STATS_ENABLED=0 disables the phase entirely (kill-switch for
+        # when the run is over its time budget) while keeping GH_TOKEN available
+        # for the rest of ingestion.
+        _commit_stats_enabled = os.getenv("COMMIT_STATS_ENABLED", "1") not in ("0", "false", "False")
+        if settings.gh_token and enrich_pairs and _commit_stats_enabled:
             items = [
                 (
                     p,
@@ -910,6 +943,23 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                         sentry_sdk.capture_exception(exc)
                     except Exception:
                         pass
+        elif enrich_pairs:
+            # Phase skipped (kill-switch off or no GH token): the payloads still
+            # carry commit counts + activity_score derived from fetched.commits,
+            # which are stale for cache-served repos. Posting them would overwrite
+            # fresher stored stats. Null them (the API's preserve sentinel) so the
+            # DB keeps its existing commit data instead.
+            for p, _f in enrich_pairs:
+                p["commits_last_7_days"] = None
+                p["commits_last_30_days"] = None
+                p["commits_last_90_days"] = None
+                p["activity_score"] = None
+                p["activity_score_breakdown"] = None
+            logger.info(
+                "phase: commit-stats refresh SKIPPED (enabled=%s, token=%s) — "
+                "commit/activity fields nulled to preserve stored values",
+                _commit_stats_enabled, bool(settings.gh_token),
+            )
 
         # Post to API
         logger.info("phase: posting to API — payloads=%d", len(payloads))
