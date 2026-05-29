@@ -77,6 +77,118 @@ def _compute_commit_stats(commits: list[dict]) -> dict:
     return stats
 
 
+# ── Commit-stats refresh — fixes the corpus-wide `last7Days = 0` freeze ───────
+#
+# The per-repo daily fetch only re-pulls commits when a repo's own
+# `github_updated_at` changes (cache.needs_daily_fetch). For the fork-heavy
+# corpus that timestamp rarely moves, so commits served from cache age past the
+# 90-day window and commits_last_*_days decay to 0 everywhere. This phase fetches
+# GitHub's /stats/commit_activity for each repo's UPSTREAM (forks have no commits
+# of their own) and overwrites the payload counts + activity_score with fresh
+# values. On unavailable stats it sets the fields to None so the API preserves
+# the stored values — a transient outage can never blank real commit counts.
+
+COMMIT_STATS_RATE_LIMIT_FLOOR = 100
+
+
+def _windows_from_weeks(weeks: list[dict]) -> tuple[int, int, int]:
+    """Collapse GitHub's 52-week commit_activity payload into 7/30/90-day totals."""
+    c7 = weeks[-1].get("total", 0) if len(weeks) >= 1 else 0
+    c30 = sum(w.get("total", 0) for w in weeks[-4:]) if len(weeks) >= 4 else 0
+    c90 = sum(w.get("total", 0) for w in weeks[-13:]) if len(weeks) >= 13 else 0
+    return c7, c30, c90
+
+
+def _refresh_commit_stats_blocking(
+    items: list[tuple[dict, int, int, bool]],
+    token: str,
+    *,
+    max_repos: int = 0,
+    rate_limit_floor: int = COMMIT_STATS_RATE_LIMIT_FLOOR,
+) -> dict:
+    """Mutate each payload's commit counts + activity_score in place from
+    GitHub /stats/commit_activity (upstream-targeted).
+
+    Synchronous/blocking by design (reuses the proven sync fetcher with its
+    202-retry) — call via ``asyncio.to_thread``. Bounded by the GitHub rate
+    limit (stops when remaining < ``rate_limit_floor``) and an optional
+    ``max_repos`` cap. When stats are unavailable for a repo the payload's
+    counts + activity fields are set to None so the API's null-skip upsert
+    preserves the stored values rather than overwriting them with 0.
+
+    ``items`` pairs each payload with (stars, forks, is_archived) so the
+    activity score can be recomputed from the fresh counts.
+    """
+    from scripts.fetch_commit_stats import fetch_commit_activity
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Default EVERY payload to the preserve sentinel (None) up front. Anything we
+    # don't successfully refresh below — capped, rate-limited, errored, or with
+    # stats unavailable, including repos never reached after an early break —
+    # then stays None, so the API's null-skip upsert keeps the stored value
+    # instead of overwriting it with a stale 0. Fresh values are written only on
+    # a confirmed success.
+    for payload, *_rest in items:
+        payload["commits_last_7_days"] = None
+        payload["commits_last_30_days"] = None
+        payload["commits_last_90_days"] = None
+        payload["activity_score"] = None
+        payload["activity_score_breakdown"] = None
+
+    updated = skipped = errors = 0
+    with httpx.Client(timeout=30.0) as client:
+        for i, (payload, stars, forks, is_archived) in enumerate(items):
+            if max_repos and i >= max_repos:
+                break
+            target = payload.get("forked_from") or f"{payload['owner']}/{payload['name']}"
+            try:
+                weeks = fetch_commit_activity(client, target, headers)
+
+                remaining = getattr(client, "_last_rate_limit_remaining", None)
+                if remaining is not None and remaining < rate_limit_floor:
+                    logger.warning(
+                        "commit-stats: GitHub rate limit low (%s remaining) — stopping early",
+                        remaining,
+                    )
+                    break
+
+                if not weeks:
+                    # None (unavailable / persistent 202 / non-200) or [] (brand-new
+                    # repo): leave the preserve sentinel in place.
+                    skipped += 1
+                    continue
+
+                c7, c30, c90 = _windows_from_weeks(weeks)
+                # Compute the score BEFORE touching the payload so a raising
+                # _compute_activity_score can't leave a partial mutation (counts
+                # set, score still the None sentinel). Either all four land, or
+                # none do and the preserve sentinel stands.
+                score = _compute_activity_score(
+                    stars=stars,
+                    forks=forks,
+                    commits_last7=c7,
+                    commits_last30=c30,
+                    commits_last90=c90,
+                    is_archived=is_archived,
+                )
+                payload["commits_last_7_days"] = c7
+                payload["commits_last_30_days"] = c30
+                payload["commits_last_90_days"] = c90
+                payload.update(score)
+                updated += 1
+            except Exception as exc:
+                errors += 1
+                logger.warning("commit-stats: error fetching %s: %s", target, exc)
+
+            time.sleep(0.5)
+
+    return {"updated": updated, "skipped": skipped, "errors": errors}
+
+
 def _build_language_percentages(breakdown: dict[str, int]) -> dict[str, float]:
     total = sum(breakdown.values())
     if not total:
@@ -756,6 +868,48 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                 ai_stats["input_tokens"],
                 ai_stats["output_tokens"],
             )
+
+        # Commit-stats refresh — overwrite stale per-repo commit windows with
+        # fresh upstream /stats/commit_activity BEFORE posting, so the counts
+        # flow through the API payload AND the trend snapshot below. Bounded by
+        # the GitHub rate limit; COMMIT_STATS_MAX_REPOS caps it per run (0 = all).
+        if settings.gh_token and enrich_pairs:
+            items = [
+                (
+                    p,
+                    f.github_repo.stars or 0,
+                    f.github_repo.forks_count or 0,
+                    bool(f.github_repo.is_archived),
+                )
+                for p, f in enrich_pairs
+            ]
+            max_repos = int(os.getenv("COMMIT_STATS_MAX_REPOS", "0") or "0")
+            logger.info(
+                "phase: commit-stats refresh starting — repos=%d max_repos=%d",
+                len(items), max_repos,
+            )
+            with console.status("Refreshing commit stats..."):
+                try:
+                    cs = await asyncio.to_thread(
+                        _refresh_commit_stats_blocking,
+                        items, settings.gh_token, max_repos=max_repos,
+                    )
+                    console.print(
+                        f"Refreshing commit stats... [green]✓[/green]  "
+                        f"{cs['updated']} updated, {cs['skipped']} preserved, "
+                        f"{cs['errors']} errors"
+                    )
+                    logger.info("phase: commit-stats refresh complete — %s", cs)
+                except Exception as exc:
+                    logger.warning(
+                        "commit-stats refresh crashed; continuing run. Error: %s",
+                        exc, exc_info=True,
+                    )
+                    try:
+                        import sentry_sdk
+                        sentry_sdk.capture_exception(exc)
+                    except Exception:
+                        pass
 
         # Post to API
         logger.info("phase: posting to API — payloads=%d", len(payloads))
