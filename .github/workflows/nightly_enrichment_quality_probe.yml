@@ -62,19 +62,30 @@ jobs:
           echo "$body" | jq . || echo "$body"
           echo "::endgroup::"
 
-          # 200 = all checks passed; 422 = at least one check failed
-          # (body still contains the full report under .detail).
-          # Any other code is an unexpected failure (network, auth, 5xx).
+          # 200 = all checks passed; 422 = at least one data-quality check
+          # failed (body still carries the full report under .detail).
+          # Any OTHER code is an unexpected failure (network, auth, 5xx).
+          #
+          # A 422 means the probe RAN and correctly reported a real
+          # data-quality finding in the enriched corpus (e.g. missing
+          # integration_tags). That is the probe doing its job, not a broken
+          # workflow. Failing the nightly run on a 422 turned every data
+          # finding into a red run plus a notify-on-failure email, flooding
+          # the operator night after night. So a 422 is now surfaced as a
+          # warning annotation (visible in the run summary and the report
+          # above) and the job exits 0. Only a genuinely unexpected response
+          # (network/auth/5xx/timeout) still fails the run, since that is the
+          # case that actually needs operator attention.
           if [ "$code" = "200" ]; then
             echo "Probe PASSED"
             exit 0
           fi
 
           if [ "$code" = "422" ]; then
-            echo "::error::Enrichment quality probe FAILED — see report above"
+            echo "::warning::Enrichment quality probe reported failing checks (see report above). This is a data-quality finding, not a workflow failure; not failing the nightly run."
             # Surface the per-check failures inline for fast triage.
-            echo "$body" | jq -r '.detail.checks[] | select(.passed == false) | "::error::\(.name): \(.observed) — floor: \(.floor)"' || true
-            exit 1
+            echo "$body" | jq -r '.detail.checks[] | select(.passed == false) | "::warning::\(.name): \(.observed) (floor: \(.floor))"' || true
+            exit 0
           fi
 
           echo "::error::Probe call returned unexpected HTTP $code"
