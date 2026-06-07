@@ -39,3 +39,7 @@ outputs/
 tmp-*.spec.*
 tmp-*.py
 scripts/reenrich_progress.db
+
+# Local $0 substrate runtime output + local env
+local/out/
+local/.env.local

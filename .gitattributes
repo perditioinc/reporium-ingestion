@@ -1,0 +1,3 @@
+# Keep shell scripts in the local $0 substrate LF so they run on Linux/CI.
+local/**/*.sh text eol=lf
+local/smoke.sh text eol=lf

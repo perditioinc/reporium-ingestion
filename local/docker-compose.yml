@@ -1,0 +1,98 @@
+name: reporium-ingestion-local
+
+# Self-contained $0 / OSS / local dev substrate for reporium-ingestion.
+# Stands up OSS substitutes for every cloud dependency the app talks to.
+#
+# Cloud -> OSS map:
+#   Cloud SQL (Postgres + pgvector)  -> pgvector/pgvector Postgres (service: postgres)
+#   GCS (graph snapshot bucket)      -> MinIO S3-compatible store  (service: minio)
+#   GCP Pub/Sub                      -> Google Pub/Sub emulator    (service: pubsub)
+#   reporium-api (Cloud Run)         -> local FastAPI stub         (service: reporium-api-stub)
+#   Anthropic Claude (paid)          -> degrades gracefully (key unset); not run here
+#   paid embeddings / Ollama         -> local stub embedder (Ollama-compatible) (service: embedder)
+#
+# Nothing here touches production or any live cloud project.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: reporium
+      POSTGRES_PASSWORD: reporium
+      POSTGRES_DB: reporium
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reporium -d reporium"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: reporium
+      MINIO_ROOT_PASSWORD: reporium-local
+    ports:
+      - "59000:9000"
+      - "59001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:emulators
+    command: >
+      /bin/sh -c "gcloud beta emulators pubsub start
+      --host-port=0.0.0.0:8085 --project=reporium-local"
+    ports:
+      - "58085:8085"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8085/ >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Local stub of reporium-api. Implements the ingest contract the pipeline
+  # writes to, persisting repos/trends/gaps/runs into the local Postgres.
+  reporium-api-stub:
+    build:
+      context: ./stub-api
+    environment:
+      DATABASE_URL: postgresql://reporium:reporium@postgres:5432/reporium
+    ports:
+      - "58000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Local Ollama-compatible embedder. Returns deterministic 384-dim vectors so
+  # the embeddings path runs end-to-end at $0 with no model download. Swap for a
+  # real Ollama container if you want true semantic vectors locally.
+  embedder:
+    build:
+      context: ./stub-embedder
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:11434/api/tags').status==200 else 1)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:
+  miniodata:
