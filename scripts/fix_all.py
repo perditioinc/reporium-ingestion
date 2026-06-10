@@ -12,8 +12,15 @@ DB_URL = os.environ["DB_URL"]
 conn = psycopg2.connect(DB_URL)
 cur = conn.cursor()
 
-# Load library.json for rich data
-with open("C:/DEV/PERDITIO_PLATFORM/reporium/public/data/library.json", encoding="utf-8") as f:
+# Load library.json for rich data.
+# Path comes from REPORIUM_LIBRARY_PATH, falling back to a sibling checkout
+# of the reporium repo next to this one.
+DEFAULT_LIBRARY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "..", "reporium", "public", "data", "library.json",
+)
+LIBRARY_PATH = os.environ.get("REPORIUM_LIBRARY_PATH", DEFAULT_LIBRARY_PATH)
+with open(LIBRARY_PATH, encoding="utf-8") as f:
     lib = json.load(f)
 lib_by_name = {r["fullName"]: r for r in lib["repos"]}
 
