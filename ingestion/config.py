@@ -11,7 +11,7 @@ def _load_secret(secret_id: str, project_id: str = "perditio-platform") -> str |
     """
     Load a secret from GCP Secret Manager, stripping any trailing whitespace/newlines.
     Returns None if the secret is not found or GCP is not available.
-    This is the ONLY place secrets are loaded from GCP — all \r\n stripping happens here.
+    This is the ONLY place secrets are loaded from GCP - all \r\n stripping happens here.
     """
     try:
         from google.cloud import secretmanager
@@ -26,7 +26,7 @@ def _load_secret(secret_id: str, project_id: str = "perditio-platform") -> str |
 
 def _resolve_credential(env_var: str, secret_id: str | None = None) -> str | None:
     """
-    Resolve a credential from (in order): GCP Secret Manager → .env → system environment.
+    Resolve a credential from (in order): GCP Secret Manager -> .env -> system environment.
     Always strips whitespace. Never logs the value.
     """
     # 1. GCP Secret Manager
@@ -72,6 +72,17 @@ class Settings(BaseSettings):
 
     # Run mode
     default_run_mode: RunMode = Field(RunMode.QUICK, env='DEFAULT_RUN_MODE')
+
+    # Cron schedules for the APScheduler runner (`python -m ingestion schedule`).
+    # 5-field crontabs read by ingestion/scheduler.py (create_scheduler) and
+    # printed by scripts/bootstrap.py. These were part of the original release
+    # (e286c87) but were dropped in 86a5d0a while scheduler.py + bootstrap.py
+    # kept reading them, which made the scheduled-runner path raise
+    # AttributeError at startup. Restored here so both call sites work again.
+    # Override per environment via the QUICK_/WEEKLY_/FULL_SCHEDULE env vars.
+    quick_schedule: str = Field('0 9 * * *', env='QUICK_SCHEDULE')      # daily 09:00
+    weekly_schedule: str = Field('0 2 * * 0', env='WEEKLY_SCHEDULE')    # Sundays 02:00
+    full_schedule: str = Field('0 3 1 * *', env='FULL_SCHEDULE')        # 1st of month 03:00
 
     # Rate limit
     min_rate_limit_buffer: int = Field(100, env='MIN_RATE_LIMIT_BUFFER')
