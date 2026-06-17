@@ -62,12 +62,24 @@ class _StubMessages:
         return _StubMessage(self._response_text)
 
 
+class _AsyncStubMessages(_StubMessages):
+    """KAN-230: production code now uses anthropic.AsyncAnthropic, so the
+    messages.create() entry point must be a coroutine. This subclass
+    overrides only the entry point — all other attributes (calls list,
+    response config) inherit from the sync stub used in earlier tests.
+    """
+
+    async def create(self, *, model: str, max_tokens: int, messages: list[dict]) -> _StubMessage:
+        return _StubMessages.create(self, model=model, max_tokens=max_tokens, messages=messages)
+
+
 class _StubAnthropicClient:
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
         self.messages = _StubMessages(_StubAnthropicClient._next_response)
 
     # Class-level slot so each test can configure what the stub returns.
+    # Both _StubAnthropicClient and _StubAsyncAnthropicClient share this.
     _next_response: str = json.dumps(
         {
             "readme_summary": (
@@ -92,6 +104,17 @@ class _StubAnthropicClient:
     )
 
 
+class _StubAsyncAnthropicClient:
+    """KAN-230 follow-up: stand-in for `anthropic.AsyncAnthropic`."""
+
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+        self.messages = _AsyncStubMessages(_StubAnthropicClient._next_response)
+
+    async def close(self) -> None:
+        pass
+
+
 @pytest.fixture
 def stub_anthropic(monkeypatch):
     """Install a stub `anthropic` module so `import anthropic` succeeds."""
@@ -102,6 +125,7 @@ def stub_anthropic(monkeypatch):
 
     fake_mod = types.ModuleType("anthropic")
     fake_mod.Anthropic = _StubAnthropicClient
+    fake_mod.AsyncAnthropic = _StubAsyncAnthropicClient
 
     class _APIError(Exception):
         pass
@@ -236,6 +260,11 @@ async def test_enrich_payloads_continues_on_per_repo_failure(stub_anthropic, mon
 
     This is the explicit KAN-199 design constraint: AI enrichment failure
     shouldn't kill the entire ingestion run.
+
+    KAN-230: per-payload calls now run concurrently under a semaphore, so
+    "the boom call is the second one" no longer maps to "boom-repo fails".
+    The fixture targets the failure by repo name (deterministic regardless
+    of scheduling order) and assertions are order-independent.
     """
     from ingestion.main import _enrich_payloads_with_ai
 
@@ -245,12 +274,14 @@ async def test_enrich_payloads_continues_on_per_repo_failure(stub_anthropic, mon
         _make_payload(name="ok-repo-2"),
     ]
 
-    call_count = {"n": 0}
     real_create = _StubMessages.create
 
     def flaky_create(self, *, model, max_tokens, messages):
-        call_count["n"] += 1
-        if call_count["n"] == 2:
+        # The first user message contains the rendered prompt with the repo
+        # name embedded — match on that to fail deterministically for the
+        # named repo, no matter what order the concurrent calls run in.
+        prompt = (messages[0] or {}).get("content", "")
+        if "boom-repo" in prompt:
             raise RuntimeError("simulated Claude transient")
         return real_create(self, model=model, max_tokens=max_tokens, messages=messages)
 
@@ -265,10 +296,11 @@ async def test_enrich_payloads_continues_on_per_repo_failure(stub_anthropic, mon
     assert stats["attempted"] == 3
     assert stats["enriched"] == 2
     assert stats["errors"] == 1
-    # The two healthy repos got enriched; the failed one keeps its empty list.
-    assert payloads[0]["integration_tags"]
-    assert payloads[2]["integration_tags"]
-    assert payloads[1]["integration_tags"] == []
+    # boom-repo (index 1) failed; the two ok-repos succeeded.
+    by_name = {p["name"]: p for p in payloads}
+    assert by_name["ok-repo-1"]["integration_tags"]
+    assert by_name["ok-repo-2"]["integration_tags"]
+    assert by_name["boom-repo"]["integration_tags"] == []
 
 
 @pytest.mark.asyncio

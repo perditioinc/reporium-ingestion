@@ -13,6 +13,7 @@ Usage:
 import asyncio
 import logging
 import math
+import os
 import sys
 import time
 import json
@@ -74,6 +75,139 @@ def _compute_commit_stats(commits: list[dict]) -> dict:
                 exc_info=True,
             )
     return stats
+
+
+# ── Commit-stats refresh — fixes the corpus-wide `last7Days = 0` freeze ───────
+#
+# The per-repo daily fetch only re-pulls commits when a repo's own
+# `github_updated_at` changes (cache.needs_daily_fetch). For the fork-heavy
+# corpus that timestamp rarely moves, so commits served from cache age past the
+# 90-day window and commits_last_*_days decay to 0 everywhere. This phase fetches
+# GitHub's /stats/commit_activity for each repo's UPSTREAM (forks have no commits
+# of their own) and overwrites the payload counts + activity_score with fresh
+# values. On unavailable stats it sets the fields to None so the API preserves
+# the stored values — a transient outage can never blank real commit counts.
+
+COMMIT_STATS_RATE_LIMIT_FLOOR = 100
+
+
+def _windows_from_weeks(weeks: list[dict]) -> tuple[int, int, int]:
+    """Collapse GitHub's 52-week commit_activity payload into 7/30/90-day totals."""
+    c7 = weeks[-1].get("total", 0) if len(weeks) >= 1 else 0
+    c30 = sum(w.get("total", 0) for w in weeks[-4:]) if len(weeks) >= 4 else 0
+    c90 = sum(w.get("total", 0) for w in weeks[-13:]) if len(weeks) >= 13 else 0
+    return c7, c30, c90
+
+
+def _refresh_commit_stats_blocking(
+    items: list[tuple[dict, int, int, bool]],
+    token: str,
+    *,
+    max_repos: int = 0,
+    rate_limit_floor: int = COMMIT_STATS_RATE_LIMIT_FLOOR,
+) -> dict:
+    """Mutate each payload's commit counts + activity_score in place from
+    GitHub /stats/commit_activity (upstream-targeted).
+
+    Synchronous/blocking by design (reuses the proven sync fetcher with its
+    202-retry) — call via ``asyncio.to_thread``. Bounded by the GitHub rate
+    limit (stops when remaining < ``rate_limit_floor``) and an optional
+    ``max_repos`` cap. When stats are unavailable for a repo the payload's
+    counts + activity fields are set to None so the API's null-skip upsert
+    preserves the stored values rather than overwriting them with 0.
+
+    ``items`` pairs each payload with (stars, forks, is_archived) so the
+    activity score can be recomputed from the fresh counts.
+    """
+    from scripts.fetch_commit_stats import fetch_commit_activity
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Default EVERY payload to the preserve sentinel (None) up front. Anything we
+    # don't successfully refresh below — capped, rate-limited, errored, or with
+    # stats unavailable, including repos never reached after an early break —
+    # then stays None, so the API's null-skip upsert keeps the stored value
+    # instead of overwriting it with a stale 0. Fresh values are written only on
+    # a confirmed success.
+    for payload, *_rest in items:
+        payload["commits_last_7_days"] = None
+        payload["commits_last_30_days"] = None
+        payload["commits_last_90_days"] = None
+        payload["activity_score"] = None
+        payload["activity_score_breakdown"] = None
+
+    updated = skipped = errors = 0
+    with httpx.Client(timeout=30.0) as client:
+        for i, (payload, stars, forks, is_archived) in enumerate(items):
+            if max_repos and i >= max_repos:
+                break
+            target = payload.get("forked_from") or f"{payload['owner']}/{payload['name']}"
+            try:
+                weeks = fetch_commit_activity(client, target, headers)
+
+                remaining = getattr(client, "_last_rate_limit_remaining", None)
+                if remaining is not None and remaining < rate_limit_floor:
+                    logger.warning(
+                        "commit-stats: GitHub rate limit low (%s remaining) — stopping early",
+                        remaining,
+                    )
+                    break
+
+                if not weeks:
+                    # None (unavailable / persistent 202 / non-200) or [] (brand-new
+                    # repo): leave the preserve sentinel in place.
+                    skipped += 1
+                    continue
+
+                c7, c30, c90 = _windows_from_weeks(weeks)
+                # Compute the score BEFORE touching the payload so a raising
+                # _compute_activity_score can't leave a partial mutation (counts
+                # set, score still the None sentinel). Either all four land, or
+                # none do and the preserve sentinel stands.
+                score = _compute_activity_score(
+                    stars=stars,
+                    forks=forks,
+                    commits_last7=c7,
+                    commits_last30=c30,
+                    commits_last90=c90,
+                    is_archived=is_archived,
+                )
+                payload["commits_last_7_days"] = c7
+                payload["commits_last_30_days"] = c30
+                payload["commits_last_90_days"] = c90
+                payload.update(score)
+                updated += 1
+            except Exception as exc:
+                errors += 1
+                logger.warning("commit-stats: error fetching %s: %s", target, exc)
+
+            time.sleep(0.5)
+
+    return {"updated": updated, "skipped": skipped, "errors": errors}
+
+
+def _apply_cached_forked_from(all_repos: list, cached: dict) -> int:
+    """Fill `forked_from` on forks from the durable cache so the subsequent
+    hydrate_fork_parents() call only has to API-fetch genuinely NEW forks.
+
+    The repo-list endpoint omits `parent`, so every fork arrives with
+    forked_from=None; hydrating all of them costs ~1 GitHub call per fork
+    (~1900 calls / ~27 min for this corpus) on every run. Repos we've already
+    ingested have forked_from stored in cache, so we reuse it here and leave
+    only brand-new forks for the API. Mutates `all_repos` in place; returns the
+    number of forks populated from cache.
+    """
+    filled = 0
+    for repo in all_repos:
+        if getattr(repo, "is_fork", False) and getattr(repo, "forked_from", None) is None:
+            cached_row = cached.get(repo.name)
+            if cached_row is not None and getattr(cached_row, "forked_from", None):
+                repo.forked_from = cached_row.forked_from
+                filled += 1
+    return filled
 
 
 def _build_language_percentages(breakdown: dict[str, int]) -> dict[str, float]:
@@ -340,6 +474,106 @@ def _merge_ai_fields_into_payload(payload: dict, ai_data: dict) -> None:
         payload["maturity_level"] = ai_data["maturity_level"]
 
 
+# KAN-230: bound to ~10 concurrent Anthropic calls. Anthropic's standard
+# tier accepts well past that, but 10× is enough to bring 1866 sequential
+# calls × ~5s each (~2.5h) down to ~16 min — comfortably inside the 30 min
+# Cloud Run Job timeout we want to drop to once cache + parallelism land.
+# Override via env var if Anthropic upgrades the tier or new repo volumes
+# justify a different ceiling.
+ENRICHMENT_CONCURRENCY = int(os.environ.get("ENRICHMENT_CONCURRENCY", "10"))
+
+
+def _enrich_force_all() -> bool:
+    """KAN-230: opt-in full re-enrich override.
+
+    Read at call time (not import) so tests and ops can flip it per run.
+    Truthy values: ``1``, ``true``, ``yes`` (case-insensitive). Default OFF.
+    """
+    return os.environ.get("ENRICH_FORCE_ALL", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _needs_ai_enrichment(fetched: "FetchedRepo", *, force_all: bool) -> bool:
+    """KAN-230 gating predicate: should this repo be sent to Claude this run?
+
+    Root cause this fixes: `ingestion.main` built a payload for every fetched
+    repo and called the per-payload Claude pass on the ENTIRE ~1866-repo
+    corpus every nightly run. With no "already enriched / unchanged" filter
+    the run blew past the Cloud Run Job timeout and `integration_tags` never
+    persisted (Nightly Enrichment Quality Probe red since ~2026-05-12).
+
+    The durable, post-#96 signal that a repo has already been fully processed
+    (and therefore already enriched on a prior run) is its ``repo_cache`` row,
+    which now lives in PostgreSQL and survives across Cloud Run Job
+    executions. A repo is "unchanged & already processed" — and so must be
+    skipped — iff ALL of:
+
+      * a durable cache row exists, AND
+      * ``cache.daily_fetched_at`` is set (it went through a full daily
+        fetch at least once → the per-payload enricher already ran for it
+        on that run), AND
+      * ``cache.github_updated_at`` equals the repo's current GitHub
+        ``updated_at`` (GitHub has not changed it since).
+
+    This mirrors the existing ``CacheDatabase.needs_daily_fetch`` logic —
+    the same change signal that already drives the structural fetch tiers —
+    so gating cannot drift from fetch behaviour. No DB schema change.
+
+    Returns ``True`` (enrich) for: ``force_all``; never-seen repos (no cache
+    row); repos fetched only at the permanent tier (``daily_fetched_at`` is
+    ``None``); and repos whose GitHub ``updated_at`` moved since last
+    processed. Returns ``False`` only for the unchanged-and-processed case.
+    """
+    if force_all:
+        return True
+
+    cache = getattr(fetched, "cache", None)
+    repo = fetched.github_repo
+
+    # Never-seen repo: FetchedRepo synthesizes an empty RepoCacheRow when the
+    # DB had no row, so a missing row presents as cache.daily_fetched_at=None
+    # and cache.github_updated_at=None — both caught below. Guard None too in
+    # case a caller passes a bare FetchedRepo.
+    if cache is None:
+        return True
+
+    # Never fully processed (only permanent tier, or brand new) → enrich.
+    if not cache.daily_fetched_at:
+        return True
+
+    # GitHub changed the repo since we last processed it → re-enrich.
+    if cache.github_updated_at != repo.updated_at:
+        return True
+
+    # Cache row + daily fetch + unchanged updated_at → already enriched on a
+    # prior run and nothing changed. Skip the Claude call.
+    return False
+
+
+def _select_payloads_for_enrichment(
+    pairs: list[tuple[dict, "FetchedRepo"]],
+) -> list[dict]:
+    """KAN-230: from (payload, fetched) pairs, return only the payloads whose
+    repo still needs AI enrichment this run.
+
+    Structural payloads for ALL repos are still built and posted to the API
+    by the caller (freshness of stars/commits/timeline is unaffected); this
+    only trims the expensive per-payload Claude pass to new/changed/forced
+    repos. WEEKLY/FULL still run the corpus-wide ``run_ai_enrichment``
+    catch-up (its own NULL-``readme_summary`` WHERE clause), so genuinely
+    under-enriched older rows are still backfilled there.
+    """
+    force_all = _enrich_force_all()
+    return [
+        payload
+        for payload, fetched in pairs
+        if _needs_ai_enrichment(fetched, force_all=force_all)
+    ]
+
+
 async def _enrich_payloads_with_ai(
     payloads: list[dict],
     *,
@@ -354,6 +588,13 @@ async def _enrich_payloads_with_ai(
     output shape is identical to the `run_ai_enrichment` direct-DB path.
     Anthropic SDK calls are dispatched to a worker thread to avoid blocking
     the asyncio event loop.
+
+    KAN-230: per-payload calls run concurrently under an
+    ``asyncio.Semaphore(ENRICHMENT_CONCURRENCY)`` (default 10). The previous
+    sequential loop took ~5s per call × ~1866 repos = ~2.5h serial, blowing
+    past the Cloud Run Job timeout on every nightly run. Concurrency drops
+    that to ~16 min for the same workload while staying inside Anthropic's
+    rate limits at the standard tier.
     """
     stats = {
         "attempted": len(payloads),
@@ -380,60 +621,86 @@ async def _enrich_payloads_with_ai(
         )
         return stats
 
-    client = anthropic.Anthropic(api_key=api_key)
+    # KAN-230 follow-up: switch from sync `Anthropic` + asyncio.to_thread to
+    # native `AsyncAnthropic`. The to_thread approach is bottlenecked by the
+    # default thread pool (~5 workers on 1 vCPU containers), which capped
+    # effective concurrency below ENRICHMENT_CONCURRENCY=10 and caused a
+    # 1866-payload run to take ~60 min instead of the predicted ~16. Native
+    # async removes the thread-pool ceiling entirely; the semaphore is the
+    # only concurrency cap that matters.
+    client = anthropic.AsyncAnthropic(api_key=api_key)
+    sem = asyncio.Semaphore(ENRICHMENT_CONCURRENCY)
+    stats_lock = asyncio.Lock()
 
-    for payload in payloads:
+    async def _enrich_one(payload: dict) -> None:
         repo_label = f"{payload.get('owner')}/{payload.get('name')}"
-        try:
-            # Build the same context shape the existing AI enricher uses.
-            context_row = {
-                "owner": payload.get("owner") or "",
-                "name": payload.get("name") or "",
-                "description": payload.get("description"),
-                "primary_language": payload.get("primary_language"),
-                "forked_from": payload.get("forked_from"),
-                "dependencies": payload.get("dependencies"),
-            }
-            prompt = ENRICHMENT_PROMPT.format(
-                repo_context=_build_repo_context(context_row)
-            )
+        async with sem:
+            try:
+                # Build the same context shape the existing AI enricher uses.
+                context_row = {
+                    "owner": payload.get("owner") or "",
+                    "name": payload.get("name") or "",
+                    "description": payload.get("description"),
+                    "primary_language": payload.get("primary_language"),
+                    "forked_from": payload.get("forked_from"),
+                    "dependencies": payload.get("dependencies"),
+                }
+                prompt = ENRICHMENT_PROMPT.format(
+                    repo_context=_build_repo_context(context_row)
+                )
 
-            def _call_claude():
-                return client.messages.create(
+                response = await client.messages.create(
                     model=model,
                     max_tokens=800,
                     messages=[{"role": "user", "content": prompt}],
                 )
+                data = _parse_enrichment_response(response.content[0].text)
+                _merge_ai_fields_into_payload(payload, data)
 
-            response = await asyncio.to_thread(_call_claude)
-            stats["input_tokens"] += response.usage.input_tokens
-            stats["output_tokens"] += response.usage.output_tokens
+                async with stats_lock:
+                    stats["input_tokens"] += response.usage.input_tokens
+                    stats["output_tokens"] += response.usage.output_tokens
+                    stats["enriched"] += 1
 
-            data = _parse_enrichment_response(response.content[0].text)
-            _merge_ai_fields_into_payload(payload, data)
-            stats["enriched"] += 1
+            except Exception as exc:
+                async with stats_lock:
+                    stats["errors"] += 1
+                logger.warning(
+                    "KAN-199: AI enrichment failed for %s: %s",
+                    repo_label,
+                    exc,
+                    exc_info=False,
+                )
+                # Best-effort Sentry capture. No-op if sentry-sdk isn't installed
+                # or hasn't been initialized.
+                try:
+                    import sentry_sdk
+                    sentry_sdk.capture_exception(exc)
+                except Exception:
+                    pass
 
-        except Exception as exc:
-            stats["errors"] += 1
-            logger.warning(
-                "KAN-199: AI enrichment failed for %s: %s",
-                repo_label,
-                exc,
-                exc_info=False,
-            )
-            # Best-effort Sentry capture. No-op if sentry-sdk isn't installed
-            # or hasn't been initialized.
-            try:
-                import sentry_sdk
-                sentry_sdk.capture_exception(exc)
-            except Exception:
-                pass
-
-        # Modest courtesy delay to avoid Anthropic rate-limit headwinds on
-        # weekly/full runs. Mirrors the 0.3s sleep in run_ai_enrichment.
-        await asyncio.sleep(0.3)
+    try:
+        await asyncio.gather(*(_enrich_one(p) for p in payloads))
+    finally:
+        await client.close()
 
     return stats
+
+
+def _make_cache(settings):
+    """Select the cache backend (KAN-230).
+
+    Durable Postgres cache (survives Cloud Run Job executions) when
+    DATABASE_URL is a postgres URL; the module-level SQLite ``CacheDatabase``
+    otherwise (local/dev/tests). The factory import is lazy and gated on a
+    string check so unit tests that stub ``ingestion.cache`` or monkeypatch
+    ``main.CacheDatabase`` keep working unchanged.
+    """
+    url = getattr(settings, "database_url", "") or ""
+    if isinstance(url, str) and url.strip().lower().startswith(("postgres://", "postgresql")):
+        from .cache import build_cache_database
+        return build_cache_database(settings)
+    return CacheDatabase(settings.cache_db_path)
 
 
 async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> None:
@@ -442,7 +709,7 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
 
     console.rule(f'[bold blue]Reporium Ingestion — {mode.value.capitalize()} Mode[/bold blue]')
 
-    db = CacheDatabase(settings.cache_db_path)
+    db = _make_cache(settings)
     await db.init()
 
     rate_limiter = RateLimitManager(min_buffer=settings.min_rate_limit_buffer)
@@ -468,16 +735,25 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
             else:
                 all_repos = await gh_client.get_repos(settings.gh_username)
 
-        # Hydrate forked_from via secondary fetch. The list endpoint returns
-        # the minimal-repository schema which omits `parent`, so forks come
-        # back with forked_from=None. Done after the fix_repos filter so a
-        # fix-mode run for 6 repos only makes ~6 extra API calls instead of
-        # one per fork in the entire account (~900, 7+ min at rate-limit).
+        # Load the durable cache ONCE, up front. It already stores forked_from
+        # for every fork we've seen, so we can fill that in locally and let
+        # hydrate_fork_parents API-fetch only genuinely NEW forks. Previously
+        # the caller hydrated ALL ~1900 forks every run (~1900 API calls / ~27
+        # min — the dominant cost of the corpus-scale run that kept tripping the
+        # Cloud Run task timeout). See hydrate_fork_parents' own docstring.
+        cached = {r.name: r for r in await db.get_all_repos()}
+        from_cache = _apply_cached_forked_from(all_repos, cached)
+
+        # Hydrate forked_from for the remaining (new) forks via secondary fetch.
+        # The list endpoint omits `parent`, so brand-new forks still have None.
         with console.status('Hydrating fork parents...'):
             await gh_client.hydrate_fork_parents(all_repos)
 
         api_calls_after_list = rate_limiter.calls_this_run
-        console.print(f'Fetching repo list... [green]✓[/green]  {len(all_repos)} repos ({api_calls_after_list} API calls)')
+        console.print(
+            f'Fetching repo list... [green]✓[/green]  {len(all_repos)} repos '
+            f'({api_calls_after_list} API calls; {from_cache} fork parents from cache)'
+        )
 
         # Estimate budget
         est = rate_limiter.estimate_calls(len(all_repos), mode)
@@ -491,9 +767,8 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                 console.print(f'[yellow]Waiting {budget.wait_seconds}s for rate limit reset...[/yellow]')
                 await asyncio.sleep(budget.wait_seconds)
 
-        # Check cache
+        # Check cache (reuse the dict loaded above for fork-parent hydration)
         with console.status('Checking cache...'):
-            cached = {r.name: r for r in await db.get_all_repos()}
             unchanged = sum(
                 1 for repo in all_repos
                 if repo.name in cached and cached[repo.name].github_updated_at == repo.updated_at
@@ -521,25 +796,71 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
             progress.update(task, completed=len(all_repos))
 
         api_calls_fetch = rate_limiter.calls_this_run
+        # KAN-230: explicit phase boundaries on the structured logger so a
+        # silent timeout becomes traceable. The Rich `console.status(...)`
+        # spinner suppresses everything until the phase completes; once a
+        # phase hangs, you cannot tell from the logs which phase you are
+        # in. logger.info() bypasses the spinner and lands in Cloud Logging
+        # immediately.
+        logger.info(
+            "phase: fetch_changed_repos complete (api_calls=%d, fetched=%d)",
+            api_calls_fetch,
+            len(fetched_repos),
+        )
 
         # Enrich with AI
+        logger.info("phase: building payloads (summarizer pass) — count=%d", len(fetched_repos))
+        # KAN-230: keep each payload paired with its FetchedRepo so the
+        # enrichment gate can read the durable (post-#96 Postgres) cache
+        # snapshot. ALL payloads are still built and posted to the API —
+        # structural freshness (stars/commits/timeline) is unaffected.
+        enrich_pairs: list[tuple[dict, FetchedRepo]] = []
         with console.status('Enriching with AI...'):
             for fetched in fetched_repos:
                 payload = await _to_api_payload(fetched, summarizer)
                 payloads.append(payload)
+                enrich_pairs.append((payload, fetched))
 
         enriched_count = len(payloads)
         console.print(f'Enriching with AI... [green]✓[/green]  {enriched_count} repos enriched')
+        logger.info("phase: payload build complete — count=%d", enriched_count)
 
-        # KAN-199: AI enrichment on the just-built payloads. Populates
+        # KAN-230: gate the expensive per-payload Claude pass. Without this,
+        # `_enrich_payloads_with_ai` was called on the ENTIRE ~1866-repo
+        # corpus every nightly run — ~1866 Claude calls that blew past the
+        # Cloud Run Job timeout, so `integration_tags` never persisted and
+        # `COMPATIBLE_WITH` edges stayed dead. We now only enrich repos that
+        # are new, changed, or forced (ENRICH_FORCE_ALL=1). Unchanged repos
+        # that were already enriched on a prior run are skipped — their AI
+        # fields already landed in the DB and the API `_upsert_repo`
+        # skip-empty guard means re-posting their structural payload with
+        # empty AI fields does NOT clobber them.
+        payloads_to_enrich = _select_payloads_for_enrichment(enrich_pairs)
+        _force_all = _enrich_force_all()
+        logger.info(
+            "phase: enrichment gate — total=%d to_enrich=%d skipped=%d force_all=%s",
+            len(enrich_pairs),
+            len(payloads_to_enrich),
+            len(enrich_pairs) - len(payloads_to_enrich),
+            _force_all,
+        )
+        console.print(
+            f'Enrichment gate (KAN-230): [cyan]{len(payloads_to_enrich)}[/cyan] '
+            f'to enrich, [dim]{len(enrich_pairs) - len(payloads_to_enrich)} '
+            f'unchanged/skipped[/dim]'
+            + ('  [yellow](ENRICH_FORCE_ALL)[/yellow]' if _force_all else '')
+        )
+
+        # KAN-199: AI enrichment on the gated payloads. Populates
         # integration_tags + open-taxonomy dimensions BEFORE the API post,
         # so they flow through /ingest/repos like every other field. Failure
         # here logs and returns; it MUST NOT abort the structural run.
-        if payloads:
+        if payloads_to_enrich:
+            logger.info("phase: AI enrichment (KAN-199) starting — count=%d", len(payloads_to_enrich))
             with console.status('AI enrichment (KAN-199)...'):
                 try:
                     ai_stats = await _enrich_payloads_with_ai(
-                        payloads,
+                        payloads_to_enrich,
                         api_key=settings.anthropic_api_key,
                         model=settings.enrichment_model,
                     )
@@ -556,9 +877,9 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                     except Exception:
                         pass
                     ai_stats = {
-                        "attempted": len(payloads),
+                        "attempted": len(payloads_to_enrich),
                         "enriched": 0,
-                        "errors": len(payloads),
+                        "errors": len(payloads_to_enrich),
                         "input_tokens": 0,
                         "output_tokens": 0,
                     }
@@ -569,13 +890,85 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                 f'(tokens: {ai_stats["input_tokens"]} in / '
                 f'{ai_stats["output_tokens"]} out)'
             )
+            logger.info(
+                "phase: AI enrichment complete — enriched=%d errors=%d input_tokens=%d output_tokens=%d",
+                ai_stats["enriched"],
+                ai_stats["errors"],
+                ai_stats["input_tokens"],
+                ai_stats["output_tokens"],
+            )
+
+        # Commit-stats refresh — overwrite stale per-repo commit windows with
+        # fresh upstream /stats/commit_activity BEFORE posting, so the counts
+        # flow through the API payload AND the trend snapshot below. Bounded by
+        # the GitHub rate limit; COMMIT_STATS_MAX_REPOS caps it per run (0 = all).
+        # COMMIT_STATS_ENABLED=0 disables the phase entirely (kill-switch for
+        # when the run is over its time budget) while keeping GH_TOKEN available
+        # for the rest of ingestion.
+        _commit_stats_enabled = os.getenv("COMMIT_STATS_ENABLED", "1") not in ("0", "false", "False")
+        if settings.gh_token and enrich_pairs and _commit_stats_enabled:
+            items = [
+                (
+                    p,
+                    f.github_repo.stars or 0,
+                    f.github_repo.forks_count or 0,
+                    bool(f.github_repo.is_archived),
+                )
+                for p, f in enrich_pairs
+            ]
+            max_repos = int(os.getenv("COMMIT_STATS_MAX_REPOS", "0") or "0")
+            logger.info(
+                "phase: commit-stats refresh starting — repos=%d max_repos=%d",
+                len(items), max_repos,
+            )
+            with console.status("Refreshing commit stats..."):
+                try:
+                    cs = await asyncio.to_thread(
+                        _refresh_commit_stats_blocking,
+                        items, settings.gh_token, max_repos=max_repos,
+                    )
+                    console.print(
+                        f"Refreshing commit stats... [green]✓[/green]  "
+                        f"{cs['updated']} updated, {cs['skipped']} preserved, "
+                        f"{cs['errors']} errors"
+                    )
+                    logger.info("phase: commit-stats refresh complete — %s", cs)
+                except Exception as exc:
+                    logger.warning(
+                        "commit-stats refresh crashed; continuing run. Error: %s",
+                        exc, exc_info=True,
+                    )
+                    try:
+                        import sentry_sdk
+                        sentry_sdk.capture_exception(exc)
+                    except Exception:
+                        pass
+        elif enrich_pairs:
+            # Phase skipped (kill-switch off or no GH token): the payloads still
+            # carry commit counts + activity_score derived from fetched.commits,
+            # which are stale for cache-served repos. Posting them would overwrite
+            # fresher stored stats. Null them (the API's preserve sentinel) so the
+            # DB keeps its existing commit data instead.
+            for p, _f in enrich_pairs:
+                p["commits_last_7_days"] = None
+                p["commits_last_30_days"] = None
+                p["commits_last_90_days"] = None
+                p["activity_score"] = None
+                p["activity_score_breakdown"] = None
+            logger.info(
+                "phase: commit-stats refresh SKIPPED (enabled=%s, token=%s) — "
+                "commit/activity fields nulled to preserve stored values",
+                _commit_stats_enabled, bool(settings.gh_token),
+            )
 
         # Post to API
+        logger.info("phase: posting to API — payloads=%d", len(payloads))
         with console.status('Posting to API...'):
             result = await api_client.upsert_repos(payloads)
             repos_updated = result.upserted
 
         console.print(f'Posting to API... [green]✓[/green]  {repos_updated} repos updated')
+        logger.info("phase: API post complete — upserted=%d errors=%d", repos_updated, len(result.errors))
         if result.errors:
             for err in result.errors[:5]:
                 console.print(f'  [red]⚠ {err}[/red]')
@@ -684,7 +1077,7 @@ async def show_status() -> None:
     settings = get_settings()
     console.rule('[bold]Reporium Ingestion — Status[/bold]')
 
-    db = CacheDatabase(settings.cache_db_path)
+    db = _make_cache(settings)
     await db.init()
 
     stats = await db.get_cache_stats()
@@ -709,7 +1102,7 @@ async def show_status() -> None:
 
 async def show_cache_stats() -> None:
     settings = get_settings()
-    db = CacheDatabase(settings.cache_db_path)
+    db = _make_cache(settings)
     await db.init()
     stats = await db.get_cache_stats()
 
@@ -721,7 +1114,7 @@ async def show_cache_stats() -> None:
 
 async def clean_cache(days: int = 90) -> None:
     settings = get_settings()
-    db = CacheDatabase(settings.cache_db_path)
+    db = _make_cache(settings)
     await db.init()
     removed = await db.clean_stale(days)
     console.print(f'[green]Removed {removed} stale cache entries (older than {days} days)[/green]')

@@ -1,5 +1,7 @@
 # reporium-ingestion
 
+![License: MIT](https://img.shields.io/badge/license-MIT-brightgreen)
+
 AI-native ingestion pipeline for Reporium. Runs on a Mac Mini, never exposed to the public internet. Currently tracking **~1,544 repos** (as of March 2026).
 
 Fetches GitHub repositories, enriches them with **Claude** (8-dimension open taxonomy), generates embeddings locally with sentence-transformers, and writes to reporium-api. Publishes GCP Pub/Sub events after each run so the API auto-refreshes taxonomy and portfolio intelligence.
