@@ -37,7 +37,11 @@ COPY scripts/ scripts/
 ENV PYTHONPATH=/app \
     PYTHONUNBUFFERED=1
 
-# Default entrypoint runs the same two steps as the deprecated GitHub Actions
-# workflow: commit-stats backfill, then the enrichment driver. Overridable via
+# Default entrypoint matches the live Cloud Run Job configuration. The
+# previous CMD pointed at `scripts/enrich_new_repos.py` which was deleted
+# in KAN-203 PR #82 ("replaced by ingestion.main per KAN-199"); the
+# deployed job already overrides via `args=["-m", "ingestion", "run",
+# "--mode", "quick"]` (verified 2026-05-12), but the orphan CMD was
+# misleading documentation. Override at execute time via
 # `gcloud run jobs execute --args=...` for ad-hoc runs.
-CMD ["bash", "-c", "python scripts/fetch_commit_stats.py && python scripts/enrich_new_repos.py"]
+CMD ["python", "-m", "ingestion", "run", "--mode", "quick"]
