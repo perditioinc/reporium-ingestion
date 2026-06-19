@@ -51,8 +51,16 @@ CREATE TABLE IF NOT EXISTS repo_cache (
   fork_sync_state      TEXT,
   behind_by            INTEGER,
   ahead_by             INTEGER,
-  sync_fetched_at      TEXT
+  sync_fetched_at      TEXT,
+  completed_at                TEXT,
+  completed_github_updated_at TEXT
 );
+
+-- Additive, idempotent: existing deployments already have a repo_cache table
+-- (CREATE TABLE IF NOT EXISTS is a no-op there), so the COMPLETED-checkpoint
+-- columns must be ALTERed in explicitly. Postgres supports IF NOT EXISTS here.
+ALTER TABLE repo_cache ADD COLUMN IF NOT EXISTS completed_at TEXT;
+ALTER TABLE repo_cache ADD COLUMN IF NOT EXISTS completed_github_updated_at TEXT;
 
 CREATE TABLE IF NOT EXISTS ingestion_runs (
   id              BIGSERIAL PRIMARY KEY,
@@ -157,6 +165,25 @@ class PostgresCacheDatabase:
 
     async def upsert_repo(self, row: RepoCacheRow) -> None:
         await asyncio.to_thread(self._upsert_repo_sync, row)
+
+    def _mark_completed_sync(self, name: str, github_updated_at: str | None) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE repo_cache "
+                    "SET completed_at=%s, completed_github_updated_at=%s "
+                    "WHERE name=%s",
+                    (now, github_updated_at, name),
+                )
+        finally:
+            conn.close()
+
+    async def mark_completed(self, name: str, github_updated_at: str | None) -> None:
+        """Set the COMPLETED checkpoint for a repo AFTER it is fully posted to
+        the API (lost-work fix). Idempotent UPDATE keyed on name."""
+        await asyncio.to_thread(self._mark_completed_sync, name, github_updated_at)
 
     async def needs_permanent_fetch(self, name: str) -> bool:
         row = await self.get_repo(name)

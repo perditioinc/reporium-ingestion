@@ -13,8 +13,19 @@ class TrendSnapshot(BaseModel):
     category_counts: dict[str, int]
 
 
-def build_trend_snapshot(repos: list[dict]) -> TrendSnapshot:
-    """Build a trend snapshot from the current enriched repo list."""
+def build_trend_snapshot(
+    repos: list[dict],
+    *,
+    total_repos_override: int | None = None,
+) -> TrendSnapshot:
+    """Build a trend snapshot from the current enriched repo list.
+
+    ``total_repos_override``: when the caller processed only a budgeted SLICE
+    of the corpus this run (resumable batching), the tag/category counts are
+    derived from the slice but ``total_repos`` should still reflect the TRUE
+    corpus size so the /trends panel does not report a collapsed total. Pass
+    the full corpus size here; leave None to use ``len(repos)`` (whole-corpus
+    runs)."""
     now = datetime.now(timezone.utc).isoformat()
 
     tag_counts: dict[str, int] = {}
@@ -49,7 +60,7 @@ def build_trend_snapshot(repos: list[dict]) -> TrendSnapshot:
 
     return TrendSnapshot(
         captured_at=now,
-        total_repos=len(repos),
+        total_repos=total_repos_override if total_repos_override is not None else len(repos),
         top_tags=top_tags,
         top_categories=top_categories,
         active_repos=active,
