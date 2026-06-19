@@ -37,7 +37,7 @@ drift accumulated before that fix is healed by
 Run this once after either of the following:
 
 1. PR #67 merges to `main` and the next nightly Cloud Run Job
-   (`reporium-ingestion-nightly`) completes successfully, OR
+   (`reporium-enrichment`) completes successfully, OR
 2. Any backfill that newly populates `repo_categories` for repos whose
    `repos.primary_category` is `NULL`.
 
@@ -117,3 +117,72 @@ follow-up rather than another column reconcile.
 - API forward-fix: [reporium-api PR #444](https://github.com/perditioinc/reporium-api/pull/444).
 - API backfill endpoint: [reporium-api PR #445](https://github.com/perditioinc/reporium-api/pull/445).
 - Ingestion fork-tag backfill: [reporium-ingestion PR #67](https://github.com/perditioinc/reporium-ingestion/pull/67).
+
+---
+
+## Resumable ingestion runs (weekly timeout fix)
+
+### Context
+
+The weekly "Manual Ingestion Run" workflow executes the `reporium-enrichment`
+Cloud Run Job (`python -m ingestion run`). Before this fix a single invocation
+walked the ENTIRE corpus (~1900 repos) every run; the commit-stats refresh
+alone sleeps 0.5s/repo, so the run could not finish inside the 3600s Cloud Run
+task timeout and was KILLED. Newly-forked repos never reached the live DB, so
+Reporium went stale (failed runs 2026-05-25 / 06-01 / 06-08 / 06-15; last clean
+ingestion 2026-05-18).
+
+### What changed
+
+`ingestion/budget.py` makes each invocation process only a bounded, prioritised
+slice of the PENDING set:
+
+- Pending = repos with no durable cache row (brand-new forks) OR whose GitHub
+  `updated_at` moved since the last run. Brand-new repos are processed FIRST so
+  freshness recovers fast.
+- `MAX_REPOS_PER_RUN` (default 400) caps how many repos a run fully processes.
+- `RUN_TIME_BUDGET_SECONDS` (default 2700) stops the slow commit-stats phase
+  before the task timeout (partial completion is safe; nothing is corrupted).
+- The durable Postgres cache is the CHECKPOINT: repos processed on a prior run
+  are skipped, so the next scheduled (or re-triggered) run RESUMES.
+- A freshness SLO metric (`FRESHNESS_SLO_HOURS`, default 48) is logged every
+  run so staleness is observable.
+
+### Operator action
+
+A run that does not drain the whole backlog finishes with status `partial` and
+prints `Still pending (re-run to continue): N`. To catch up faster, simply
+re-trigger the "Manual Ingestion Run" workflow (or wait for the weekly cron);
+each run drains the next batch until the corpus reports 0 pending. The
+production RUN itself is operator-gated (`workflow_dispatch`) — this fix does
+not auto-run it.
+
+Tuning: raise `MAX_REPOS_PER_RUN` once a run is observed to comfortably finish a
+full batch in budget; set it to `0` to disable the cap (legacy whole-corpus
+behaviour). `RESERVE_OLDEST_FRACTION` (default 0.25) reserves part of each run's
+cap for the OLDEST pending repos so old deferred work cannot starve under a
+steady stream of new forks; set it to `0` for pure newest-first.
+
+### Deploying the timeout/env changes (Fix #6 -- target reconciliation)
+
+The live Cloud Run job is named **`reporium-enrichment`** (NOT
+`reporium-ingestion-nightly`). The weekly run invokes it as
+`python -m ingestion run`. The resumable timeout/env settings live in
+`deploy/job.yaml`, whose `metadata.name` is now `reporium-enrichment` so a
+`gcloud run jobs replace` actually updates the live job. AN OPERATOR MUST APPLY
+IT:
+
+```bash
+PROJECT_ID=perditio-platform REGION=us-central1
+sed -e "s/PROJECT_ID/$PROJECT_ID/g" -e "s/REGION/$REGION/g" deploy/job.yaml \
+  | gcloud run jobs replace - --region "$REGION"
+
+# Verify the changes landed:
+gcloud run jobs describe reporium-enrichment --region "$REGION" \
+  --format='yaml(spec.template.spec.template.spec.timeoutSeconds)'
+```
+
+The code defaults are safe if the env vars are never set (see
+`ingestion/budget.py`: 400 / 2700 / 0.25 / 48), so the resumable behaviour holds
+even before the manifest is applied; applying it just bumps `timeoutSeconds`
+(3600 -> 5400, defense-in-depth) and makes the budget knobs explicit/tunable.

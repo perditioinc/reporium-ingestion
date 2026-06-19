@@ -51,7 +51,7 @@ def test_refresh_targets_upstream_and_applies_fresh_counts():
     assert payload["commits_last_30_days"] == 3 + 4 + 5 + 6
     assert payload["activity_score"] > 0             # recomputed from fresh counts
     assert payload["activity_score_breakdown"] is not None
-    assert stats == {"updated": 1, "skipped": 0, "errors": 0}
+    assert stats == {"updated": 1, "skipped": 0, "errors": 0, "deadline_deferred": 0}
 
 
 def test_refresh_non_fork_targets_owner_name():
@@ -88,7 +88,7 @@ def test_refresh_preserves_on_unavailable():
     assert payload["commits_last_30_days"] is None
     assert payload["commits_last_90_days"] is None
     assert payload["activity_score"] is None
-    assert stats == {"updated": 0, "skipped": 1, "errors": 0}
+    assert stats == {"updated": 0, "skipped": 1, "errors": 0, "deadline_deferred": 0}
 
 
 def test_refresh_preserves_on_empty_weeks():

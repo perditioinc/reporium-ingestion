@@ -89,3 +89,17 @@ spec:
                       key: latest
                 - name: GCP_PROJECT
                   value: PROJECT_ID
+                # Resumable-run budget knobs (ingestion/budget.py). These apply
+                # when the job is invoked as `python -m ingestion run` (the
+                # weekly "Manual Ingestion Run" path -- see deploy/job.yaml,
+                # which overrides the container command). They are harmless for
+                # the default Dockerfile.enrichment CMD (the two scripts ignore
+                # them). Code defaults are safe if unset: 400 / 2700 / 0.25 / 48.
+                - name: MAX_REPOS_PER_RUN
+                  value: "400"
+                - name: RUN_TIME_BUDGET_SECONDS
+                  value: "2700"
+                - name: RESERVE_OLDEST_FRACTION
+                  value: "0.25"
+                - name: FRESHNESS_SLO_HOURS
+                  value: "48"

@@ -39,6 +39,15 @@ class RepoCacheRow(BaseModel):
     ahead_by: int | None = None
     sync_fetched_at: str | None = None
 
+    # COMPLETED checkpoint (resumable runs, lost-work fix). Distinct from the
+    # fetcher's daily_fetched_at: set ONLY after the repo is fully posted to the
+    # API. is_checkpointed treats a repo as "done" only when completed_at is set
+    # and completed_github_updated_at matches the current GitHub updated_at, so
+    # a run killed mid-pipeline (after fetch, before post) is re-processed next
+    # run instead of being silently skipped.
+    completed_at: str | None = None
+    completed_github_updated_at: str | None = None
+
 
 class IngestionRun(BaseModel):
     id: int | None = None
@@ -76,7 +85,10 @@ CREATE TABLE IF NOT EXISTS repo_cache (
   fork_sync_state   TEXT,
   behind_by         INTEGER,
   ahead_by          INTEGER,
-  sync_fetched_at   TEXT
+  sync_fetched_at   TEXT,
+
+  completed_at                 TEXT,
+  completed_github_updated_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS ingestion_runs (
