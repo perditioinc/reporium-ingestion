@@ -655,3 +655,26 @@ def test_commit_stats_runs_all_when_deadline_far(monkeypatch):
     assert result["deadline_deferred"] == 0
     for payload, *_ in items:
         assert payload["commits_last_7_days"] == 2  # last week total
+
+
+def test_reserved_oldest_is_at_head_to_survive_deadline_truncation():
+    """Fix #3 follow-up: the reserved-oldest slice must sit at the HEAD of the
+    returned work order. The commit-stats deadline truncates the TRAILING items,
+    so reserving slots at the tail (the old behaviour) let a deadline cut drop
+    exactly the repos we reserved for fairness -- defeating the reservation.
+    4 brand-new (newest) + 1 very old pending; cap=4 bites; 1 slot reserved."""
+    repos = [
+        FakeRepo("new1", "2026-06-05T00:00:00Z"),
+        FakeRepo("new2", "2026-06-04T00:00:00Z"),
+        FakeRepo("new3", "2026-06-03T00:00:00Z"),
+        FakeRepo("new4", "2026-06-02T00:00:00Z"),
+        FakeRepo("old", "2020-01-01T00:00:00Z"),
+    ]
+    sel = select_work_for_run(repos, {}, max_repos=4, reserve_oldest=0.25)
+    assert sel.capped
+    assert sel.reserved_oldest >= 1
+    head_names = [r.name for r in sel.selected[: sel.reserved_oldest]]
+    assert "old" in head_names, (
+        "reserved-oldest must be at the HEAD so a trailing deadline cut still "
+        f"processes it; got selected={[r.name for r in sel.selected]}"
+    )
