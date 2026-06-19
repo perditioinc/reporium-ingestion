@@ -11,10 +11,25 @@ class CacheDatabase:
     def __init__(self, db_path: str):
         self.db_path = db_path
 
+    # Additive, idempotent columns introduced after the original CREATE TABLE.
+    # CREATE TABLE IF NOT EXISTS will not add columns to a table that already
+    # exists, so we ALTER them in explicitly. SQLite has no ADD COLUMN IF NOT
+    # EXISTS, so we swallow the "duplicate column" error.
+    _MIGRATIONS = (
+        ("repo_cache", "completed_at", "TEXT"),
+        ("repo_cache", "completed_github_updated_at", "TEXT"),
+    )
+
     async def init(self) -> None:
         os.makedirs(os.path.dirname(self.db_path) if os.path.dirname(self.db_path) else '.', exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
             await db.executescript(CREATE_TABLES_SQL)
+            for table, column, coltype in self._MIGRATIONS:
+                try:
+                    await db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {coltype}')
+                except Exception:
+                    # Column already exists (older DBs that pre-date this run).
+                    pass
             await db.commit()
 
     # ── repo_cache ──────────────────────────────────────────────────────────
@@ -44,6 +59,19 @@ class CacheDatabase:
         """
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(sql, list(data.values()))
+            await db.commit()
+
+    async def mark_completed(self, name: str, github_updated_at: str | None) -> None:
+        """Set the COMPLETED checkpoint for a repo AFTER it is fully posted to
+        the API (lost-work fix). Idempotent UPDATE keyed on name; a no-op if the
+        row does not exist (the fetcher always writes a row before this runs)."""
+        now = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                'UPDATE repo_cache SET completed_at=?, completed_github_updated_at=? '
+                'WHERE name=?',
+                (now, github_updated_at, name),
+            )
             await db.commit()
 
     async def needs_permanent_fetch(self, name: str) -> bool:

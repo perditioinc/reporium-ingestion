@@ -39,6 +39,7 @@ trivially unit-testable with fakes and deterministic offline.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -68,6 +69,14 @@ DEFAULT_RUN_TIME_BUDGET_SECONDS = 2700
 # run; it emits a metric/log the operator (or a probe) can alert on.
 DEFAULT_FRESHNESS_SLO_HOURS = 48
 
+# Fix #3 (backlog drain fairness): fraction of the per-run cap reserved for the
+# OLDEST pending repos so a steady stream of new forks can never starve old
+# deferred/changed work forever. The reserved slots are filled oldest-first
+# across BOTH tiers (new + changed); the remaining slots keep the newest-first
+# freshness-recovery behaviour. 0.0 disables the reservation (pure newest-first,
+# legacy behaviour). Clamped to [0.0, 1.0].
+DEFAULT_RESERVE_OLDEST_FRACTION = 0.25
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
@@ -76,6 +85,9 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
+        logging.getLogger(__name__).warning(
+            "env %s=%r is not an integer -- using default %s", name, raw, default
+        )
         return default
 
 
@@ -91,46 +103,110 @@ def freshness_slo_hours() -> int:
     return _env_int("FRESHNESS_SLO_HOURS", DEFAULT_FRESHNESS_SLO_HOURS)
 
 
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var; WARN (never crash) on garbage and fall back to
+    the default so a malformed override can't take down the weekly run."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "env %s=%r is not a number -- using default %s", name, raw, default
+        )
+        return default
+
+
+def reserve_oldest_fraction() -> float:
+    frac = _env_float("RESERVE_OLDEST_FRACTION", DEFAULT_RESERVE_OLDEST_FRACTION)
+    return min(1.0, max(0.0, frac))
+
+
 # -- Helpers -------------------------------------------------------------------
 
 
-def _parse_iso(value: str | None) -> datetime | None:
-    """Best-effort parse of a GitHub ISO-8601 timestamp to an aware datetime.
+def _parse_iso(value: Any) -> datetime | None:
+    """Best-effort parse of an ISO-8601 timestamp to an aware UTC datetime.
 
-    Returns None on missing/malformed input so callers can treat it as
-    "unknown" rather than crash. Accepts the trailing-Z form GitHub emits.
+    Accepts EITHER a string (the trailing-Z form GitHub emits, or an explicit
+    offset) OR an already-parsed ``datetime`` (some code paths/tests hand the
+    repo a real datetime). Anything else -> None so callers can treat it as
+    "unknown" rather than crash. The result is normalised to UTC so two values
+    for the same instant compare equal regardless of how they were spelled
+    (Fix #7).
     """
-    if not value or not isinstance(value, str):
+    if value is None:
         return None
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    else:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt.astimezone(timezone.utc)
+
+
+def _same_instant(a: Any, b: Any) -> bool:
+    """True iff ``a`` and ``b`` denote the SAME UTC instant.
+
+    Fix #7: ``is_checkpointed`` previously compared the raw cached
+    ``github_updated_at`` against the repo's ``updated_at`` with ``==``. When
+    one side is a ``datetime`` and the other a string (or the two strings carry
+    different precision / offset spellings, e.g. ``...Z`` vs ``...+00:00`` vs
+    ``...00:00.000``), equality fails even though they are the same moment --
+    so EVERY repo stays pending and the backlog never drains. Parse both sides
+    to UTC instants and compare those. If EITHER side is unparseable, fall back
+    to raw equality so a non-timestamp marker still matches itself.
+    """
+    pa, pb = _parse_iso(a), _parse_iso(b)
+    if pa is not None and pb is not None:
+        return pa == pb
+    return a == b
 
 
 def is_checkpointed(repo: Any, cached: dict[str, Any]) -> bool:
-    """Has this repo already been fully processed on a prior run (the durable
-    CHECKPOINT signal)?
+    """Has this repo already been FULLY processed on a prior run (the durable
+    COMPLETED CHECKPOINT signal)?
 
-    Mirrors ``main._needs_ai_enrichment`` / ``CacheDatabase.needs_daily_fetch``
-    so the budget cannot drift from the fetch/enrich change-detection logic.
+    Fix #1 (lost-work): the checkpoint must NOT be the fetcher's
+    ``daily_fetched_at`` -- that row is written in the FETCHER, BEFORE
+    summarise / enrich / commit-stats / API-upsert. A run killed after the
+    fetch but before the API post would otherwise look "done" and the next run
+    would SKIP the repo, losing all the downstream work. We therefore require a
+    SEPARATE ``completed_at`` marker that the pipeline sets ONLY after the repo
+    has been successfully posted to the API.
+
     A repo is checkpointed iff ALL of:
 
       * a durable cache row exists, AND
-      * ``daily_fetched_at`` is set (it went through a full fetch at least
-        once), AND
-      * the cached ``github_updated_at`` equals the repo's CURRENT GitHub
-        ``updated_at`` (GitHub has not changed it since).
+      * ``completed_at`` is set (the API post for it succeeded on some run), AND
+      * the ``completed_github_updated_at`` recorded at completion is the SAME
+        instant as the repo's CURRENT GitHub ``updated_at`` -- i.e. GitHub has
+        not changed it since we completed it. (Parsed to UTC instants, Fix #7.)
+
+    Backward-compatibility: rows written before this change have no
+    ``completed_at`` column / value, so they read as None and are treated as
+    NOT checkpointed -- they will be re-processed once (idempotent: the API
+    upsert + null-skip guard makes re-posting safe) and then carry the new
+    marker. This errs on the side of re-doing work, never of losing it.
     """
     row = cached.get(getattr(repo, "name", None))
     if row is None:
         return False
-    if getattr(row, "daily_fetched_at", None) is None:
+    if getattr(row, "completed_at", None) is None:
         return False
-    return getattr(row, "github_updated_at", None) == getattr(repo, "updated_at", None)
+    return _same_instant(
+        getattr(row, "completed_github_updated_at", None),
+        getattr(repo, "updated_at", None),
+    )
 
 
 def _is_brand_new(repo: Any, cached: dict[str, Any]) -> bool:
@@ -152,6 +228,13 @@ class WorkSelection:
     new_count: int = 0                              # brand-new repos in `selected`
     changed_count: int = 0                          # changed repos in `selected`
     capped: bool = False                            # was the cap actually hit?
+    corpus_size: int = 0                            # OPTIONAL: full corpus size
+    reserved_oldest: int = 0                        # Fix #3: oldest slots filled
+
+    @property
+    def selected_count(self) -> int:
+        """OPTIONAL: how many repos this run actually processes (vs corpus)."""
+        return len(self.selected)
 
     @property
     def is_complete(self) -> bool:
@@ -164,15 +247,26 @@ def select_work_for_run(
     cached: dict[str, Any],
     *,
     max_repos: int | None = None,
+    reserve_oldest: float | None = None,
 ) -> WorkSelection:
     """Partition the corpus into done/pending and return the prioritised slice
     this invocation should process.
 
     Pending = NOT ``is_checkpointed`` (brand-new OR changed-since-checkpoint).
-    Priority order, so freshness recovers fastest:
+    Base priority, so freshness recovers fastest:
 
       1. Brand-new repos (no cache row) -- newest GitHub ``updated_at`` first.
       2. Changed repos (cache row exists but GitHub moved) -- newest first.
+
+    Fix #3 (backlog drain fairness / no starvation): a pure newest-first policy
+    lets a steady stream of new forks starve old deferred/changed work forever.
+    We therefore RESERVE a fraction (``reserve_oldest``, env
+    ``RESERVE_OLDEST_FRACTION``) of the per-run cap for the OLDEST pending repos
+    (across both tiers, oldest GitHub ``updated_at`` first). Those reserved
+    slots guarantee forward progress on the backlog tail every run, so any
+    backlog drains in bounded time even under continuous arrivals. The
+    remaining slots keep the newest-first behaviour. ``reserve_oldest`` only
+    matters when the cap actually bites (pending > cap).
 
     ``max_repos`` (env ``MAX_REPOS_PER_RUN`` by default) caps how many enter
     THIS run; the remainder are reported as ``deferred`` and picked up by the
@@ -183,10 +277,16 @@ def select_work_for_run(
     """
     if max_repos is None:
         max_repos = max_repos_per_run()
+    if reserve_oldest is None:
+        reserve_oldest = reserve_oldest_fraction()
+    reserve_oldest = min(1.0, max(0.0, reserve_oldest))
+
+    repos = list(all_repos)
+    corpus_size = len(repos)
 
     new_repos: list = []
     changed_repos: list = []
-    for repo in all_repos:
+    for repo in repos:
         if is_checkpointed(repo, cached):
             continue
         if _is_brand_new(repo, cached):
@@ -201,13 +301,52 @@ def select_work_for_run(
     new_repos.sort(key=key, reverse=True)
     changed_repos.sort(key=key, reverse=True)
 
-    ordered = new_repos + changed_repos
+    ordered = new_repos + changed_repos      # newest-first priority order
     pending_total = len(ordered)
 
-    if max_repos and max_repos > 0:
-        selected = ordered[:max_repos]
+    capped = bool(max_repos and max_repos > 0 and pending_total > max_repos)
+
+    if not capped:
+        # No cap, or everything fits -- take it all (reservation is moot).
+        selected = list(ordered)
+        reserved_count = 0
     else:
-        selected = ordered
+        cap = max_repos
+        # Reserve the oldest pending slots (across both tiers). At least one
+        # slot is reserved whenever reserve_oldest > 0 and a cap bites, so the
+        # tail can never be perpetually crowded out by new arrivals.
+        reserved_count = int(cap * reserve_oldest)
+        if reserve_oldest > 0:
+            reserved_count = max(1, reserved_count)
+        reserved_count = min(reserved_count, cap)
+
+        # Oldest-first ordering of the whole pending set (deterministic).
+        oldest_first = sorted(ordered, key=key)
+        reserved: list = []
+        reserved_ids: set[int] = set()
+        for r in oldest_first:
+            if len(reserved) >= reserved_count:
+                break
+            reserved.append(r)
+            reserved_ids.add(id(r))
+
+        # Fill the remaining slots newest-first, skipping anything already
+        # reserved so we never double-count.
+        remaining_slots = cap - len(reserved)
+        head: list = []
+        for r in ordered:
+            if remaining_slots <= 0:
+                break
+            if id(r) in reserved_ids:
+                continue
+            head.append(r)
+            remaining_slots -= 1
+
+        # Preserve newest-first presentation order for the head, then append the
+        # reserved-oldest tail. Processing order does not affect correctness
+        # (each repo is checkpointed independently), but keeping the freshness
+        # head first means new forks still land first within the run.
+        selected = head + [r for r in reserved if id(r) not in {id(h) for h in head}]
 
     selected_set = {id(r) for r in selected}
     new_in_selected = sum(1 for r in new_repos if id(r) in selected_set)
@@ -219,7 +358,9 @@ def select_work_for_run(
         deferred=pending_total - len(selected),
         new_count=new_in_selected,
         changed_count=changed_in_selected,
-        capped=bool(max_repos and max_repos > 0 and pending_total > max_repos),
+        capped=capped,
+        corpus_size=corpus_size,
+        reserved_oldest=reserved_count,
     )
 
 
@@ -236,6 +377,13 @@ class FreshnessReport:
     newest_pending_repo: str | None = None
     newest_pending_updated_at: str | None = None
     lag_hours: float | None = None
+    # OPTIONAL: also report the OLDEST pending repo so the operator can see how
+    # far the backlog tail has fallen behind (the SLO uses the newest, which is
+    # the freshest change we have not yet landed; the oldest is the worst-case
+    # tail latency the fairness reservation is draining).
+    oldest_pending_repo: str | None = None
+    oldest_pending_updated_at: str | None = None
+    oldest_lag_hours: float | None = None
     slo_hours: int = DEFAULT_FRESHNESS_SLO_HOURS
     breached: bool = False
 
@@ -246,6 +394,11 @@ class FreshnessReport:
             "freshness_newest_pending_repo": self.newest_pending_repo,
             "freshness_lag_hours": (
                 round(self.lag_hours, 2) if self.lag_hours is not None else None
+            ),
+            "freshness_oldest_pending_repo": self.oldest_pending_repo,
+            "freshness_oldest_lag_hours": (
+                round(self.oldest_lag_hours, 2)
+                if self.oldest_lag_hours is not None else None
             ),
             "freshness_slo_hours": self.slo_hours,
             "freshness_slo_breached": self.breached,
@@ -288,4 +441,13 @@ def compute_freshness(
     if newest_dt is not None:
         report.lag_hours = max(0.0, (now - newest_dt).total_seconds() / 3600.0)
         report.breached = report.lag_hours > slo_hours
+
+    # OPTIONAL: the OLDEST pending repo is the worst-case backlog-tail age that
+    # the Fix #3 oldest-reservation is responsible for draining.
+    oldest = min(pending, key=_updated)
+    oldest_dt = _parse_iso(getattr(oldest, "updated_at", None))
+    report.oldest_pending_repo = getattr(oldest, "name", None)
+    report.oldest_pending_updated_at = getattr(oldest, "updated_at", None)
+    if oldest_dt is not None:
+        report.oldest_lag_hours = max(0.0, (now - oldest_dt).total_seconds() / 3600.0)
     return report
