@@ -1017,7 +1017,14 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
         # If the per-run deadline is already crossed, skip enrichment cleanly --
         # the structural payloads are still posted below, and the unenriched
         # repos are NOT marked completed, so the next run re-enriches them.
+        budget_deferred_enrich_names: set = set()
         if payloads_to_enrich and _budget_exhausted(run_deadline):
+            # Record which repos had enrichment deferred by the budget so we do
+            # NOT mark them completed below (they must be re-enriched next run).
+            _deferred_ids = {id(p) for p in payloads_to_enrich}
+            budget_deferred_enrich_names = {
+                f.github_repo.name for (p, f) in enrich_pairs if id(p) in _deferred_ids
+            }
             logger.warning(
                 "phase: AI enrichment skipped -- per-run budget exhausted; "
                 "deferring enrichment of %d repos to next run",
@@ -1183,6 +1190,15 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
         if enrich_pairs and not result.errors:
             completable = enrich_pairs[:len(enrich_pairs) - cs_deadline_deferred] \
                 if cs_deadline_deferred else enrich_pairs
+            # Do NOT checkpoint repos whose enrichment was budget-deferred this
+            # run: leave them pending so the next run re-enriches them. They are
+            # still posted above, so freshness is preserved -- only enrichment
+            # (not ingestion) is deferred.
+            if budget_deferred_enrich_names:
+                completable = [
+                    (_p, _f) for (_p, _f) in completable
+                    if _f.github_repo.name not in budget_deferred_enrich_names
+                ]
             marked = 0
             for _p, _f in completable:
                 try:

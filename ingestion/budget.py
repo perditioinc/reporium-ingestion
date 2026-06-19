@@ -342,11 +342,14 @@ def select_work_for_run(
             head.append(r)
             remaining_slots -= 1
 
-        # Preserve newest-first presentation order for the head, then append the
-        # reserved-oldest tail. Processing order does not affect correctness
-        # (each repo is checkpointed independently), but keeping the freshness
-        # head first means new forks still land first within the run.
-        selected = head + [r for r in reserved if id(r) not in {id(h) for h in head}]
+        # Place the RESERVED-OLDEST slice at the HEAD of the work order, then the
+        # newest-first head. The commit-stats budget deadline truncates TRAILING
+        # items, so reserving slots at the tail (the old behaviour) let a deadline
+        # cut drop exactly the repos we reserved for fairness -- defeating the
+        # anti-starvation guarantee. Putting them first ensures the backlog tail
+        # makes progress every run even under a deadline; the newest forks follow
+        # immediately after the small reserved block, so freshness is preserved.
+        selected = reserved + [r for r in head if id(r) not in {id(x) for x in reserved}]
 
     selected_set = {id(r) for r in selected}
     new_in_selected = sum(1 for r in new_repos if id(r) in selected_set)

@@ -258,3 +258,40 @@ async def test_status_partial_when_some_repos_left_uncheckpointed(monkeypatch):
     await main_module.run_ingestion(RunMode.QUICK)
 
     assert db.finished_status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_budget_deferred_enrichment_repos_not_marked_completed(monkeypatch):
+    """Fix #1/#4 follow-up: when AI enrichment is skipped because the per-run
+    budget is exhausted, the repos that WERE selected for enrichment must NOT be
+    marked completed -- otherwise they are skipped next run and never enriched
+    until their GitHub updated_at changes. They are still posted (freshness), but
+    left un-checkpointed so the next run re-enriches them."""
+    corpus = [
+        _FakeGHRepo("a", "2026-06-10T00:00:00Z"),
+        _FakeGHRepo("b", "2026-06-11T00:00:00Z"),
+    ]
+    db = _FakeDB([])
+    fake_api, _ = _wire(monkeypatch, corpus=corpus, db=db)
+    # The enrichment gate selects ALL posted payloads this run.
+    monkeypatch.setattr(
+        main_module, "_select_payloads_for_enrichment",
+        lambda pairs: [p for p, _ in pairs],
+    )
+    # Budget: NOT exhausted at the fetch guard (1st call) so fetch+post proceed;
+    # exhausted at the enrichment guard (subsequent calls) so enrichment defers.
+    state = {"calls": 0}
+
+    def fake_exhausted(deadline):
+        state["calls"] += 1
+        return state["calls"] > 1
+
+    monkeypatch.setattr(main_module, "_budget_exhausted", fake_exhausted)
+
+    await main_module.run_ingestion(RunMode.QUICK)
+
+    fake_api.upsert_repos.assert_awaited()  # repos WERE posted (freshness kept)
+    completed = {n for n, _ in db.completed}
+    assert completed == set(), (
+        f"budget-deferred-enrichment repos must not be marked completed; got {completed}"
+    )
