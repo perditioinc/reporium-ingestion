@@ -8,7 +8,14 @@ spec:
       template:
         spec:
           maxRetries: 1
-          timeoutSeconds: 3600
+          # Defense-in-depth only. The PRIMARY fix for the weekly timeout is
+          # resumable batching in ingestion/budget.py: each run processes only
+          # MAX_REPOS_PER_RUN of the pending set (newest forks first) and stops
+          # at RUN_TIME_BUDGET_SECONDS, so a single invocation finishes well
+          # under this ceiling and the durable Postgres cache lets the next run
+          # resume. The modest bump to 5400s (90 min) just widens the safety
+          # margin; it is NOT the mechanism that keeps runs in budget.
+          timeoutSeconds: 5400
           containers:
             - image: gcr.io/PROJECT_ID/reporium-ingestion:latest
               command:
@@ -55,3 +62,20 @@ spec:
                 # sides will default to 50.
                 - name: PROBE_SUMMARY_MIN_CHARS
                   value: "50"
+                # Resumable-run budget (ingestion/budget.py). Each invocation
+                # fully processes at most MAX_REPOS_PER_RUN of the pending set
+                # (newest forks prioritised) and stops queuing new repos after
+                # RUN_TIME_BUDGET_SECONDS, so the run finishes inside the task
+                # timeout. The next scheduled (or re-triggered) run resumes from
+                # the durable Postgres cache. Tune up once a run is observed to
+                # comfortably finish a full pending batch in budget. Set
+                # MAX_REPOS_PER_RUN=0 to disable the cap (legacy whole-corpus).
+                - name: MAX_REPOS_PER_RUN
+                  value: "400"
+                - name: RUN_TIME_BUDGET_SECONDS
+                  value: "2700"
+                # Freshness SLO (hours): age of the newest GitHub repo not yet
+                # in the DB beyond which the run logs a breach (observability
+                # only; never fails the run).
+                - name: FRESHNESS_SLO_HOURS
+                  value: "48"

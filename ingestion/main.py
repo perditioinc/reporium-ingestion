@@ -28,6 +28,11 @@ from rich.panel import Panel
 from rich import print as rprint
 
 from .config import get_settings, RunMode
+from .budget import (
+    select_work_for_run,
+    compute_freshness,
+    run_time_budget_seconds,
+)
 from .cache.database import CacheDatabase
 from .github.rate_limit import RateLimitManager
 from .github.client import GitHubClient
@@ -105,16 +110,21 @@ def _refresh_commit_stats_blocking(
     *,
     max_repos: int = 0,
     rate_limit_floor: int = COMMIT_STATS_RATE_LIMIT_FLOOR,
+    deadline: float | None = None,
 ) -> dict:
     """Mutate each payload's commit counts + activity_score in place from
     GitHub /stats/commit_activity (upstream-targeted).
 
     Synchronous/blocking by design (reuses the proven sync fetcher with its
     202-retry) — call via ``asyncio.to_thread``. Bounded by the GitHub rate
-    limit (stops when remaining < ``rate_limit_floor``) and an optional
-    ``max_repos`` cap. When stats are unavailable for a repo the payload's
-    counts + activity fields are set to None so the API's null-skip upsert
-    preserves the stored values rather than overwriting them with 0.
+    limit (stops when remaining < ``rate_limit_floor``), an optional
+    ``max_repos`` cap, and an optional wall-clock ``deadline`` (a
+    ``time.monotonic()`` value): when crossed the loop stops early so this
+    phase -- the slowest, at 0.5s sleep/repo -- can never push the invocation
+    past the Cloud Run task timeout. When stats are unavailable for a repo
+    the payload's counts + activity fields are set to None so the API's
+    null-skip upsert preserves the stored values rather than overwriting them
+    with 0.
 
     ``items`` pairs each payload with (stars, forks, is_archived) so the
     activity score can be recomputed from the fresh counts.
@@ -139,10 +149,18 @@ def _refresh_commit_stats_blocking(
         payload["activity_score"] = None
         payload["activity_score_breakdown"] = None
 
-    updated = skipped = errors = 0
+    updated = skipped = errors = deadline_stops = 0
     with httpx.Client(timeout=30.0) as client:
         for i, (payload, stars, forks, is_archived) in enumerate(items):
             if max_repos and i >= max_repos:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                deadline_stops = len(items) - i
+                logger.warning(
+                    "commit-stats: per-run time budget exhausted after %d repos "
+                    "-- deferring %d to next run",
+                    i, deadline_stops,
+                )
                 break
             target = payload.get("forked_from") or f"{payload['owner']}/{payload['name']}"
             try:
@@ -186,7 +204,12 @@ def _refresh_commit_stats_blocking(
 
             time.sleep(0.5)
 
-    return {"updated": updated, "skipped": skipped, "errors": errors}
+    return {
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+        "deadline_deferred": deadline_stops,
+    }
 
 
 def _apply_cached_forked_from(all_repos: list, cached: dict) -> int:
@@ -778,6 +801,71 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
 
         console.print(f'Checking cache... [green]✓[/green]  {unchanged} unchanged, {changed} updated')
 
+        # ── Resumable per-run budgeting (fix for the 3600s Cloud Run timeout) ──
+        #
+        # Process only a BOUNDED, PRIORITISED slice of the pending set this
+        # invocation so the run finishes well under the task timeout. The
+        # durable Postgres cache is the checkpoint: repos processed on a prior
+        # run are skipped, so the next scheduled (or re-triggered) run drains
+        # whatever is still pending. Newly-forked repos are prioritised so
+        # freshness recovers in the first run even with a backlog.
+        #
+        # Fix mode is exempt -- the operator named an explicit, small repo set
+        # and expects ALL of them processed regardless of checkpoint state.
+        corpus_size = len(all_repos)
+        freshness = compute_freshness(all_repos, cached)
+        logger.info("freshness SLO: %s", freshness.as_metrics())
+        if freshness.breached:
+            console.print(
+                f'[yellow]Freshness SLO breached: newest pending repo '
+                f'"{freshness.newest_pending_repo}" is '
+                f'{freshness.lag_hours:.1f}h old (SLO {freshness.slo_hours}h)[/yellow]'
+            )
+        else:
+            console.print(
+                f'Freshness: [green]✓[/green]  '
+                f'{freshness.pending_total} pending, '
+                f'lag '
+                + (f'{freshness.lag_hours:.1f}h' if freshness.lag_hours is not None else 'n/a')
+                + f' (SLO {freshness.slo_hours}h)'
+            )
+
+        if fix_repos:
+            selection = None
+            deferred_repos = 0
+        else:
+            selection = select_work_for_run(all_repos, cached)
+            deferred_repos = selection.deferred
+            all_repos = selection.selected
+            logger.info(
+                "phase: work selection -- corpus=%d pending=%d selected=%d "
+                "(new=%d changed=%d) deferred=%d capped=%s",
+                corpus_size,
+                selection.pending_total,
+                len(selection.selected),
+                selection.new_count,
+                selection.changed_count,
+                selection.deferred,
+                selection.capped,
+            )
+            console.print(
+                f'Work selection: [cyan]{len(all_repos)}[/cyan] this run '
+                f'([green]{selection.new_count} new[/green], '
+                f'{selection.changed_count} changed)'
+                + (
+                    f'  [yellow]{selection.deferred} deferred to next run[/yellow]'
+                    if selection.deferred
+                    else '  [dim](corpus fully drained)[/dim]'
+                )
+            )
+
+        # Per-run wall-clock budget: when crossed, later phases stop and exit
+        # cleanly (partial completion) so a single invocation never runs into
+        # the 3600s task timeout. The cache is upserted per-repo inside the
+        # fetcher, so a partial run leaves durable checkpoints and the next run
+        # resumes from there.
+        time_budget_s = run_time_budget_seconds()
+
         # Fetch updated repos
         fetcher = RepoFetcher(gh_client, db)
         payloads: list[dict] = []
@@ -917,15 +1005,27 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                 for p, f in enrich_pairs
             ]
             max_repos = int(os.getenv("COMMIT_STATS_MAX_REPOS", "0") or "0")
+            # Translate the per-run wall-clock budget (measured from
+            # `start_time` via time.time) into a time.monotonic() deadline for
+            # the blocking refresh. When `time_budget_s <= 0` (cap disabled)
+            # pass None so the phase runs unbounded.
+            if time_budget_s and time_budget_s > 0:
+                remaining_budget = time_budget_s - (time.time() - start_time)
+                cs_deadline = time.monotonic() + max(0.0, remaining_budget)
+            else:
+                cs_deadline = None
             logger.info(
-                "phase: commit-stats refresh starting — repos=%d max_repos=%d",
+                "phase: commit-stats refresh starting -- repos=%d max_repos=%d "
+                "budget_remaining_s=%s",
                 len(items), max_repos,
+                round(time_budget_s - (time.time() - start_time), 1) if cs_deadline else "unbounded",
             )
             with console.status("Refreshing commit stats..."):
                 try:
                     cs = await asyncio.to_thread(
                         _refresh_commit_stats_blocking,
                         items, settings.gh_token, max_repos=max_repos,
+                        deadline=cs_deadline,
                     )
                     console.print(
                         f"Refreshing commit stats... [green]✓[/green]  "
@@ -1032,12 +1132,21 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
     elapsed = time.time() - start_time
     total_api_calls = rate_limiter.calls_this_run
 
+    # `partial` = the run intentionally processed only a slice of the pending
+    # corpus this invocation (work-selection cap). The deferred repos are NOT a
+    # failure -- their durable checkpoint is still absent/stale, so the next
+    # scheduled (or re-triggered) run continues. Recording it distinctly keeps
+    # run history honest and lets the operator/scheduler know to re-trigger.
+    _partial = deferred_repos > 0
+    _run_status = "partial" if _partial else "completed"
+
     await db.finish_run(
         run_id=run_id,
-        repos_processed=len(all_repos),
+        repos_processed=corpus_size,
         repos_updated=repos_updated,
         api_calls_made=total_api_calls,
         rate_limit_hits=0,
+        status=_run_status,
     )
 
     # Best-effort: record run in reporium-api for the run-history endpoint
@@ -1054,9 +1163,11 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                 f"{settings.reporium_api_url.rstrip('/')}/admin/runs",
                 json={
                     "run_mode": mode.value,
-                    "status": "success",
+                    # "partial" when more repos remain pending for the next run;
+                    # "success" when the corpus was fully drained this run.
+                    "status": "partial" if _partial else "success",
                     "repos_upserted": repos_updated,
-                    "repos_processed": len(all_repos),
+                    "repos_processed": corpus_size,
                     "errors": [],
                     "started_at": _started_at.isoformat(),
                     "finished_at": _finished_at.isoformat(),
@@ -1066,10 +1177,26 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
     except Exception as _exc:
         logging.getLogger(__name__).debug("Could not record run in API: %s", _exc)
 
+    logger.info(
+        "run complete: status=%s elapsed_s=%.0f corpus=%d processed_this_run=%d "
+        "upserted=%d deferred=%d api_calls=%d",
+        _run_status, elapsed, corpus_size, len(all_repos),
+        repos_updated, deferred_repos, total_api_calls,
+    )
+
     console.rule()
-    console.print(f'[green bold]✓ Complete in {elapsed:.0f}s[/green bold]')
-    console.print(f'  API calls: {total_api_calls} (saved ~{max(0, len(all_repos)*5 - total_api_calls)} with cache)')
+    if _partial:
+        console.print(
+            f'[yellow bold]Partial run complete in {elapsed:.0f}s[/yellow bold] '
+            f'[dim](re-run to continue: {deferred_repos} repos still pending)[/dim]'
+        )
+    else:
+        console.print(f'[green bold]Complete in {elapsed:.0f}s[/green bold]')
+    console.print(f'  API calls: {total_api_calls} (saved ~{max(0, corpus_size*5 - total_api_calls)} with cache)')
+    console.print(f'  Repos processed this run: {len(all_repos)} / {corpus_size} corpus')
     console.print(f'  Repos updated: {repos_updated}')
+    if deferred_repos:
+        console.print(f'  Deferred to next run: {deferred_repos}')
     console.print(f'  Rate limit remaining: {rate_limiter.remaining:,}')
 
 
