@@ -111,12 +111,6 @@ def _build_repo_context(row: dict) -> str:
         f"Description: {row.get('description') or 'None'}",
         f"Primary Language: {row.get('primary_language') or 'Unknown'}",
     ]
-    if row.get('dependencies'):
-        deps = row['dependencies']
-        if isinstance(deps, str):
-            deps = json.loads(deps)
-        if deps:
-            parts.append(f"Dependencies: {', '.join(deps[:20])}")
     if row.get('forked_from'):
         parts.append(f"Forked from: {row['forked_from']}")
     return "\n".join(parts)
@@ -228,7 +222,7 @@ async def run_ai_enrichment(
 
     # Get repos needing enrichment (readme_summary IS NULL)
     cur.execute("""
-        SELECT id, name, owner, description, primary_language, forked_from, dependencies
+        SELECT id, name, owner, description, primary_language, forked_from
         FROM repos
         WHERE readme_summary IS NULL
         ORDER BY name;
@@ -265,24 +259,33 @@ async def run_ai_enrichment(
             text = response.content[0].text
             data = _parse_enrichment_response(text)
 
-            # KAN-227: write only the three real `repos` columns. The eight
-            # other taxonomy dimensions returned by Claude (quality_assessment,
-            # maturity_level, skill_areas, industries, use_cases, modalities,
-            # ai_trends, deployment_context) were never added to the Alembic
-            # schema — they are routed through repo_taxonomy via
-            # /ingest/repos/{name}/enrich for the fresh-fetch path. Writing
-            # them here previously raised UndefinedColumn and was silently
-            # swallowed by the catch-all below, rolling back the entire row.
+            # KAN-227: write the four real `repos` columns only. The remaining
+            # taxonomy dimensions returned by Claude (skill_areas, industries,
+            # use_cases, modalities, ai_trends, deployment_context) were never
+            # added to the Alembic schema -- they are routed through
+            # repo_taxonomy via /ingest/repos/{name}/enrich for the
+            # fresh-fetch path. quality_assessment + maturity_level ARE
+            # persisted here as quality_signals JSONB, mirroring the working
+            # API path (reporium-api app/routers/ingest.py: repo.quality_signals
+            # = {"quality": ..., "maturity": ...}). `dependencies` was dropped
+            # from the SELECT because reporium-api migration 014 removed that
+            # column from the repos table.
+            quality_signals = {
+                "quality": data.get("quality_assessment"),
+                "maturity": data.get("maturity_level"),
+            }
             cur.execute(
                 """UPDATE repos SET
                     readme_summary = %s,
                     problem_solved = %s,
-                    integration_tags = %s::jsonb
+                    integration_tags = %s::jsonb,
+                    quality_signals = %s::jsonb
                 WHERE id = %s""",
                 (
                     data.get("readme_summary"),
                     data.get("problem_solved"),
                     json.dumps(data.get("integration_tags") or []),
+                    json.dumps(quality_signals),
                     repo["id"],
                 ),
             )
