@@ -189,6 +189,7 @@ async def test_enrich_payloads_populates_integration_tags(stub_anthropic):
         payloads,
         api_key="sk-ant-test-fake-key",
         model="claude-sonnet-4-20250514",
+        provider="frontier",
     )
 
     assert stats["attempted"] == 1
@@ -227,6 +228,7 @@ async def test_enrich_payloads_skips_when_api_key_missing(stub_anthropic):
         payloads,
         api_key="",
         model="claude-sonnet-4-20250514",
+        provider="frontier",
     )
 
     assert stats["enriched"] == 0
@@ -243,6 +245,7 @@ async def test_enrich_payloads_skips_empty_list(stub_anthropic):
         [],
         api_key="sk-ant-test",
         model="claude-sonnet-4-20250514",
+        provider="frontier",
     )
 
     assert stats == {
@@ -251,6 +254,9 @@ async def test_enrich_payloads_skips_empty_list(stub_anthropic):
         "errors": 0,
         "input_tokens": 0,
         "output_tokens": 0,
+        "local": 0,
+        "frontier": 0,
+        "escalated": 0,
     }
 
 
@@ -291,6 +297,7 @@ async def test_enrich_payloads_continues_on_per_repo_failure(stub_anthropic, mon
         payloads,
         api_key="sk-ant-test",
         model="claude-sonnet-4-20250514",
+        provider="frontier",
     )
 
     assert stats["attempted"] == 3
