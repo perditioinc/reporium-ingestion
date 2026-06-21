@@ -1,0 +1,59 @@
+{
+  "passed": true,
+  "reason": "OK: candidate 0.9148 vs baseline 0.5000 (delta +0.4148 >= -0.05)",
+  "threshold": 0.05,
+  "elapsed_s": 59.0,
+  "n_records": 8,
+  "candidate": {
+    "label": "local_qwen2.5_7b",
+    "composite": 0.9148,
+    "tiers": {
+      "deterministic": 1.0,
+      "nli": 0.8676,
+      "judge": 0.7917
+    },
+    "skipped_tiers": [],
+    "deterministic_per_record": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "json_shape_pass_rate": 1.0,
+    "mean_deterministic": 1.0
+  },
+  "baseline": {
+    "label": "frontier_reference",
+    "composite": 0.5,
+    "tiers": {
+      "deterministic": 0.0,
+      "nli": 1.0,
+      "judge": 1.0
+    },
+    "skipped_tiers": []
+  },
+  "delta": 0.4148,
+  "quality_only": {
+    "tiers": [
+      "nli",
+      "judge"
+    ],
+    "candidate": 0.8296,
+    "reference": 1.0,
+    "delta": -0.1704,
+    "caveat": "The baseline is the curated reference itself, so its NLI/judge tiers are a near-perfect self-comparison (an upper bound, not a fair frontier bar at $0). Read the candidate's quality as an absolute floor (see candidate_quality_floor), and the deterministic shape pass-rate as the real regression contract."
+  },
+  "candidate_quality_floor": {
+    "tiers": [
+      "nli",
+      "judge"
+    ],
+    "candidate_quality": 0.8296,
+    "floor": 0.65,
+    "passed": true
+  }
+}

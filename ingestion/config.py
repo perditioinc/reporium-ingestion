@@ -60,9 +60,15 @@ class Settings(BaseSettings):
     reporium_api_key: str = Field('', env='REPORIUM_API_KEY')
     ingest_api_key: str = Field('', env='INGEST_API_KEY')
 
-    # Claude API (replaces Ollama)
+    # Enrichment provider (issue #148): local-first qwen2.5:7b via Ollama is the
+    # $0 default; 'frontier' restores the pre-#148 Claude-only path; 'auto' is
+    # local-first with frontier escalation on low confidence. The Anthropic key
+    # is only required for 'frontier' / 'auto' escalation.
+    enrichment_provider: str = Field('local', env='ENRICHMENT_PROVIDER')
     anthropic_api_key: str = Field('', env='ANTHROPIC_API_KEY')
     enrichment_model: str = Field('claude-sonnet-4-20250514', env='ENRICHMENT_MODEL')
+    # Local enrichment model tag (Ollama). Defaults to the keep-warm 7B.
+    enrichment_local_model: str = Field('qwen2.5:7b-instruct-q4_K_M', env='ENRICHMENT_LOCAL_MODEL')
 
     # Embeddings (local sentence-transformers, free)
     embedding_model: str = Field('all-MiniLM-L6-v2', env='EMBEDDING_MODEL')

@@ -126,7 +126,26 @@ python -m ingestion schedule
 
 ## AI Enrichment — 8 Taxonomy Dimensions
 
-Every repo is enriched by Claude with **open-ended** values across 8 dimensions. There are no hardcoded lists — values are generated freely from each repo's README, topics, and description, then stored in the database and assigned via pgvector cosine similarity.
+Every repo is enriched with **open-ended** values across 8 dimensions. There are no hardcoded lists - values are generated freely from each repo's README, topics, and description, then stored in the database and assigned via pgvector cosine similarity.
+
+### Provider (issue #148): local-first, $0 by default
+
+Enrichment runs off the hot path (nightly taxonomy refresh), so it defaults to a
+**local** model - `qwen2.5:7b-instruct-q4_K_M` served by Ollama (OpenAI-compatible,
+`127.0.0.1:11434`) via constrained JSON decoding. Set `ENRICHMENT_PROVIDER`:
+
+| Value | Behavior | Cost |
+|-------|----------|------|
+| `local` (default) | local qwen2.5:7b, constrained JSON | **$0** |
+| `frontier` | Claude only (pre-#148 behavior; needs `ANTHROPIC_API_KEY`) | paid |
+| `auto` | local-first, escalate to Claude on low confidence (needs a key) | mostly $0 |
+
+The prompt, parser, and output shape are **identical** across providers, so the
+swap is drop-in. A `$0` no-regression gate (`eval/run_enrichment_gate.py`,
+reusing the estate `local-inference` harness) proves the local taxonomy passes
+the deterministic shape contract (valid JSON + all 11 fields + in-vocab enums +
+non-empty integration_tags) at **1.0** on the golden set and clears the quality
+floor - see `eval/gate_result.json`.
 
 | Dimension | Description | Examples |
 |-----------|-------------|---------|
@@ -139,7 +158,7 @@ Every repo is enriched by Claude with **open-ended** values across 8 dimensions.
 | `tags` | Cross-cutting labels | `production-ready`, `research`, `benchmark` |
 | `maturity_level` | Repo maturity | `prototype`, `production`, `research` |
 
-**Cost:** ~$0.003/repo for Claude enrichment. Adding new taxonomy values costs ~$0.00001 (one local embedding) — no Claude re-enrichment of existing repos required.
+**Cost:** **$0/repo** with the default local provider (`ENRICHMENT_PROVIDER=local`); ~$0.003/repo if escalated to Claude (`frontier`/`auto`). Adding new taxonomy values costs ~$0.00001 (one local embedding) - no re-enrichment of existing repos required.
 
 ---
 

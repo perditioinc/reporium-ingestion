@@ -50,6 +50,7 @@ from .enrichers.ai_enricher import (
     _parse_enrichment_response,
     run_ai_enrichment,
 )
+from .enrichers.provider import PROVIDER_FRONTIER, resolve_provider
 from .api.client import ReporiumAPIClient
 from .analysis.trends import build_trend_snapshot
 from .analysis.gaps import detect_gaps
@@ -645,22 +646,25 @@ async def _enrich_payloads_with_ai(
     *,
     api_key: str,
     model: str,
+    provider: str | None = None,
+    local_model: str | None = None,
 ) -> dict:
-    """For every just-built payload, call Claude and merge AI fields back in.
+    """For every just-built payload, enrich its taxonomy and merge AI fields back.
 
     Mutates `payloads` in place. Returns a stats dict for logging.
 
-    Uses the same prompt + parser as `ingestion.enrichers.ai_enricher` so
-    output shape is identical to the `run_ai_enrichment` direct-DB path.
-    Anthropic SDK calls are dispatched to a worker thread to avoid blocking
-    the asyncio event loop.
+    Issue #148: enrichment is now provider-routed through
+    ``ingestion.enrichers.provider.EnrichmentProvider``. The $0 default is the
+    LOCAL qwen2.5:7b path (Ollama, constrained JSON); ``ENRICHMENT_PROVIDER=
+    frontier`` restores the pre-#148 Claude-only behavior; ``auto`` is local-first
+    with frontier escalation on low confidence. The prompt + parser are shared, so
+    the merged output shape is identical to the ``run_ai_enrichment`` direct-DB
+    path regardless of backend.
 
     KAN-230: per-payload calls run concurrently under an
-    ``asyncio.Semaphore(ENRICHMENT_CONCURRENCY)`` (default 10). The previous
-    sequential loop took ~5s per call × ~1866 repos = ~2.5h serial, blowing
-    past the Cloud Run Job timeout on every nightly run. Concurrency drops
-    that to ~16 min for the same workload while staying inside Anthropic's
-    rate limits at the standard tier.
+    ``asyncio.Semaphore(ENRICHMENT_CONCURRENCY)`` (default 10). For the local
+    path the underlying client is sync and dispatched to a worker thread inside
+    the provider, so the event loop is never blocked.
     """
     stats = {
         "attempted": len(payloads),
@@ -668,33 +672,31 @@ async def _enrich_payloads_with_ai(
         "errors": 0,
         "input_tokens": 0,
         "output_tokens": 0,
+        "local": 0,
+        "frontier": 0,
+        "escalated": 0,
     }
     if not payloads:
         return stats
-    if not api_key:
+
+    from .enrichers.provider import (
+        EnrichmentProvider,
+        PROVIDER_FRONTIER,
+        resolve_provider,
+    )
+
+    active = resolve_provider(provider)
+    # Frontier-only mode with no key is a no-op (preserves the pre-#148 guard so
+    # integration_tags stay empty rather than crashing the structural run).
+    if active == PROVIDER_FRONTIER and not api_key:
         logger.warning(
-            "KAN-199: ANTHROPIC_API_KEY not set — skipping per-payload AI "
-            "enrichment; integration_tags will remain empty for this run."
+            "ENRICHMENT_PROVIDER=frontier but ANTHROPIC_API_KEY not set - "
+            "skipping per-payload AI enrichment; integration_tags will remain "
+            "empty for this run."
         )
         return stats
 
-    try:
-        import anthropic
-    except ImportError:
-        logger.warning(
-            "KAN-199: anthropic SDK not installed — skipping per-payload AI "
-            "enrichment. Add `anthropic` to requirements.txt to enable."
-        )
-        return stats
-
-    # KAN-230 follow-up: switch from sync `Anthropic` + asyncio.to_thread to
-    # native `AsyncAnthropic`. The to_thread approach is bottlenecked by the
-    # default thread pool (~5 workers on 1 vCPU containers), which capped
-    # effective concurrency below ENRICHMENT_CONCURRENCY=10 and caused a
-    # 1866-payload run to take ~60 min instead of the predicted ~16. Native
-    # async removes the thread-pool ceiling entirely; the semaphore is the
-    # only concurrency cap that matters.
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    enricher = EnrichmentProvider(provider=active, local_model=local_model)
     sem = asyncio.Semaphore(ENRICHMENT_CONCURRENCY)
     stats_lock = asyncio.Lock()
 
@@ -711,28 +713,29 @@ async def _enrich_payloads_with_ai(
                     "forked_from": payload.get("forked_from"),
                     "dependencies": payload.get("dependencies"),
                 }
-                prompt = ENRICHMENT_PROMPT.format(
-                    repo_context=_build_repo_context(context_row)
+                result = await enricher.enrich_one(
+                    context_row,
+                    api_key=api_key,
+                    frontier_model=model,
                 )
-
-                response = await client.messages.create(
-                    model=model,
-                    max_tokens=800,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                data = _parse_enrichment_response(response.content[0].text)
-                _merge_ai_fields_into_payload(payload, data)
+                _merge_ai_fields_into_payload(payload, result.data)
 
                 async with stats_lock:
-                    stats["input_tokens"] += response.usage.input_tokens
-                    stats["output_tokens"] += response.usage.output_tokens
+                    stats["input_tokens"] += result.input_tokens
+                    stats["output_tokens"] += result.output_tokens
                     stats["enriched"] += 1
+                    if result.backend.startswith("frontier:"):
+                        stats["frontier"] += 1
+                    else:
+                        stats["local"] += 1
+                    if result.escalated:
+                        stats["escalated"] += 1
 
             except Exception as exc:
                 async with stats_lock:
                     stats["errors"] += 1
                 logger.warning(
-                    "KAN-199: AI enrichment failed for %s: %s",
+                    "#148: AI enrichment failed for %s: %s",
                     repo_label,
                     exc,
                     exc_info=False,
@@ -745,10 +748,7 @@ async def _enrich_payloads_with_ai(
                 except Exception:
                     pass
 
-    try:
-        await asyncio.gather(*(_enrich_one(p) for p in payloads))
-    finally:
-        await client.close()
+    await asyncio.gather(*(_enrich_one(p) for p in payloads))
 
     return stats
 
@@ -1044,6 +1044,8 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                         payloads_to_enrich,
                         api_key=settings.anthropic_api_key,
                         model=settings.enrichment_model,
+                        provider=getattr(settings, "enrichment_provider", None),
+                        local_model=getattr(settings, "enrichment_local_model", None),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1063,6 +1065,9 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
                         "errors": len(payloads_to_enrich),
                         "input_tokens": 0,
                         "output_tokens": 0,
+                        "local": 0,
+                        "frontier": 0,
+                        "escalated": 0,
                     }
             console.print(
                 f'AI enrichment: [green]✓[/green]  '
@@ -1227,13 +1232,23 @@ async def run_ingestion(mode: RunMode, fix_repos: list[str] | None = None) -> No
         # clause filters to the unset population). Runs only on weekly/full
         # to keep `quick` short; the per-payload pass above covers freshly
         # ingested repos for `quick` runs.
-        if mode in (RunMode.WEEKLY, RunMode.FULL) and settings.database_url and settings.anthropic_api_key:
-            with console.status('AI enrichment catch-up (KAN-199)...'):
+        #
+        # #148: the catch-up is provider-routed like the per-payload pass. The
+        # $0 local provider needs no API key, so the catch-up runs whenever a DB
+        # URL is present; the frontier path still requires anthropic_api_key.
+        _catchup_provider = resolve_provider(getattr(settings, "enrichment_provider", None))
+        _catchup_can_run = settings.database_url and (
+            _catchup_provider != PROVIDER_FRONTIER or settings.anthropic_api_key
+        )
+        if mode in (RunMode.WEEKLY, RunMode.FULL) and _catchup_can_run:
+            with console.status('AI enrichment catch-up (#148)...'):
                 try:
                     catchup_stats = await run_ai_enrichment(
                         db_url=settings.database_url,
                         api_key=settings.anthropic_api_key,
                         model=settings.enrichment_model,
+                        provider=_catchup_provider,
+                        local_model=getattr(settings, "enrichment_local_model", None),
                     )
                     console.print(
                         f'AI catch-up: [green]✓[/green]  '
