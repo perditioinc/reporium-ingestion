@@ -355,6 +355,7 @@ async def test_only_selected_payloads_hit_claude(stub_anthropic, monkeypatch):
         to_enrich,
         api_key="sk-ant-test",
         model="claude-sonnet-4-20250514",
+        provider="frontier",
     )
 
     assert stats["attempted"] == 1

@@ -11,10 +11,28 @@ class TrendSnapshot(BaseModel):
     new_repos_last_30d: int
     tag_counts: dict[str, int]
     category_counts: dict[str, int]
+    # Honest coverage label for the tag/category counts: "full_corpus" when built
+    # from the whole corpus, "run_slice" when built from this run's budgeted
+    # slice. The raw corpus / cache do not carry the enriched tags+categories, so
+    # a budgeted run can only count the slice; authoritative full-corpus trends
+    # are computed server-side from the DB. This lets consumers decide whether to
+    # trust the posted counts or recompute.
+    counts_basis: str = "full_corpus"
 
 
-def build_trend_snapshot(repos: list[dict]) -> TrendSnapshot:
-    """Build a trend snapshot from the current enriched repo list."""
+def build_trend_snapshot(
+    repos: list[dict],
+    *,
+    total_repos_override: int | None = None,
+) -> TrendSnapshot:
+    """Build a trend snapshot from the current enriched repo list.
+
+    ``total_repos_override``: when the caller processed only a budgeted SLICE
+    of the corpus this run (resumable batching), the tag/category counts are
+    derived from the slice but ``total_repos`` should still reflect the TRUE
+    corpus size so the /trends panel does not report a collapsed total. Pass
+    the full corpus size here; leave None to use ``len(repos)`` (whole-corpus
+    runs)."""
     now = datetime.now(timezone.utc).isoformat()
 
     tag_counts: dict[str, int] = {}
@@ -47,13 +65,22 @@ def build_trend_snapshot(repos: list[dict]) -> TrendSnapshot:
     top_tags = sorted(tag_counts, key=lambda t: tag_counts[t], reverse=True)[:20]
     top_categories = sorted(category_counts, key=lambda c: category_counts[c], reverse=True)[:10]
 
+    # Counts cover only the rows we were given. If the caller is correcting the
+    # total upward (a budgeted slice run), the counts are slice-derived; say so.
+    counts_basis = (
+        "run_slice"
+        if total_repos_override is not None and total_repos_override > len(repos)
+        else "full_corpus"
+    )
+
     return TrendSnapshot(
         captured_at=now,
-        total_repos=len(repos),
+        total_repos=total_repos_override if total_repos_override is not None else len(repos),
         top_tags=top_tags,
         top_categories=top_categories,
         active_repos=active,
         new_repos_last_30d=new_last_30d,
         tag_counts=tag_counts,
         category_counts=category_counts,
+        counts_basis=counts_basis,
     )

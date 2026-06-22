@@ -16,8 +16,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import anthropic
 import psycopg2
+
+try:
+    import anthropic  # frontier escalation path; optional in pure-local installs
+
+    _ANTHROPIC_API_ERROR: type[BaseException] = anthropic.APIError
+except ImportError:  # pragma: no cover - anthropic is a declared runtime dep
+    anthropic = None  # type: ignore[assignment]
+
+    class _AnthropicAPIErrorUnavailable(Exception):
+        """Sentinel so the `except` branch below is valid when the anthropic SDK
+        is absent (pure-local installs). It can never be raised, so the branch is
+        simply never taken."""
+
+    _ANTHROPIC_API_ERROR = _AnthropicAPIErrorUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -111,12 +124,6 @@ def _build_repo_context(row: dict) -> str:
         f"Description: {row.get('description') or 'None'}",
         f"Primary Language: {row.get('primary_language') or 'Unknown'}",
     ]
-    if row.get('dependencies'):
-        deps = row['dependencies']
-        if isinstance(deps, str):
-            deps = json.loads(deps)
-        if deps:
-            parts.append(f"Dependencies: {', '.join(deps[:20])}")
     if row.get('forked_from'):
         parts.append(f"Forked from: {row['forked_from']}")
     return "\n".join(parts)
@@ -210,11 +217,25 @@ async def run_ai_enrichment(
     api_key: str,
     model: str = "claude-sonnet-4-20250514",
     base_dir: str = ".",
+    provider: str | None = None,
+    local_model: str | None = None,
 ) -> RunStats:
     """
     Main entry point: enrich all repos that have null readme_summary.
     Writes COST_LOG.md and RESUME.md every 50 repos.
+
+    #148: per-repo enrichment is routed through
+    ``ingestion.enrichers.provider.EnrichmentProvider``. The $0 local qwen2.5:7b
+    path is the default; ``provider='frontier'`` restores the Claude-only
+    behavior; ``provider='auto'`` is local-first with frontier escalation. The
+    DB write, cost log, and resume bookkeeping below are unchanged -- only the
+    model call is abstracted behind the provider, so cost accounting stays
+    accurate (local calls report 0 tokens / $0).
     """
+    from .provider import EnrichmentProvider, resolve_provider
+
+    active = resolve_provider(provider)
+    enricher = EnrichmentProvider(provider=active, local_model=local_model)
     base = Path(base_dir)
     cost_log_path = base / "COST_LOG.md"
     resume_path = base / "RESUME.md"
@@ -228,7 +249,7 @@ async def run_ai_enrichment(
 
     # Get repos needing enrichment (readme_summary IS NULL)
     cur.execute("""
-        SELECT id, name, owner, description, primary_language, forked_from, dependencies
+        SELECT id, name, owner, description, primary_language, forked_from
         FROM repos
         WHERE readme_summary IS NULL
         ORDER BY name;
@@ -244,45 +265,48 @@ async def run_ai_enrichment(
         conn.close()
         return stats
 
-    client = anthropic.Anthropic(api_key=api_key)
-
     for i, repo in enumerate(repos):
         repo_name = f"{repo['owner']}/{repo['name']}"
 
         try:
-            context = _build_repo_context(repo)
-            prompt = ENRICHMENT_PROMPT.format(repo_context=context)
-
-            response = client.messages.create(
-                model=model,
-                max_tokens=800,
-                messages=[{"role": "user", "content": prompt}],
+            result = await enricher.enrich_one(
+                repo,
+                api_key=api_key,
+                frontier_model=model,
             )
 
-            stats.total_input_tokens += response.usage.input_tokens
-            stats.total_output_tokens += response.usage.output_tokens
+            stats.total_input_tokens += result.input_tokens
+            stats.total_output_tokens += result.output_tokens
 
-            text = response.content[0].text
-            data = _parse_enrichment_response(text)
+            data = result.data
 
-            # KAN-227: write only the three real `repos` columns. The eight
-            # other taxonomy dimensions returned by Claude (quality_assessment,
-            # maturity_level, skill_areas, industries, use_cases, modalities,
-            # ai_trends, deployment_context) were never added to the Alembic
-            # schema — they are routed through repo_taxonomy via
-            # /ingest/repos/{name}/enrich for the fresh-fetch path. Writing
-            # them here previously raised UndefinedColumn and was silently
-            # swallowed by the catch-all below, rolling back the entire row.
+            # KAN-227: write the four real `repos` columns only. The remaining
+            # taxonomy dimensions returned by Claude (skill_areas, industries,
+            # use_cases, modalities, ai_trends, deployment_context) were never
+            # added to the Alembic schema -- they are routed through
+            # repo_taxonomy via /ingest/repos/{name}/enrich for the
+            # fresh-fetch path. quality_assessment + maturity_level ARE
+            # persisted here as quality_signals JSONB, mirroring the working
+            # API path (reporium-api app/routers/ingest.py: repo.quality_signals
+            # = {"quality": ..., "maturity": ...}). `dependencies` was dropped
+            # from the SELECT because reporium-api migration 014 removed that
+            # column from the repos table.
+            quality_signals = {
+                "quality": data.get("quality_assessment"),
+                "maturity": data.get("maturity_level"),
+            }
             cur.execute(
                 """UPDATE repos SET
                     readme_summary = %s,
                     problem_solved = %s,
-                    integration_tags = %s::jsonb
+                    integration_tags = %s::jsonb,
+                    quality_signals = %s::jsonb
                 WHERE id = %s""",
                 (
                     data.get("readme_summary"),
                     data.get("problem_solved"),
                     json.dumps(data.get("integration_tags") or []),
+                    json.dumps(quality_signals),
                     repo["id"],
                 ),
             )
@@ -296,7 +320,7 @@ async def run_ai_enrichment(
             logger.warning("JSON parse error for %s: %s", repo_name, e)
             conn.rollback()
 
-        except anthropic.APIError as e:
+        except _ANTHROPIC_API_ERROR as e:
             stats.errors += 1
             stats.error_repos.append(repo_name)
             logger.warning("Claude API error for %s: %s", repo_name, e)
